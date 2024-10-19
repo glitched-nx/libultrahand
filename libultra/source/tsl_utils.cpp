@@ -20,8 +20,20 @@
 
 #include <tsl_utils.hpp>
 
+#include <cstdlib>
+extern "C" { // assertion override
+    void __assert_func(const char *_file, int _line, const char *_func, const char *_expr ) {
+        abort();
+    }
+}
+
+
 namespace ult {
-    
+    bool correctFrameSize; // for detecting the correct Overlay display size
+
+    u16 DefaultFramebufferWidth = 448;            ///< Width of the framebuffer
+    u16 DefaultFramebufferHeight = 720;           ///< Height of the framebuffer
+
     std::unordered_map<std::string, std::string> translationCache;
     
 
@@ -246,6 +258,11 @@ namespace ult {
         // Quick check to see if the string contains a '+'
         if (combo.find('+') == std::string::npos) {
             return;  // No '+' found, nothing to modify
+        }
+
+        // Exit early if the combo contains any spaces
+        if (combo.find(' ') != std::string::npos) {
+            return;  // Spaces found, return without modifying
         }
     
         std::string unicodeCombo;
@@ -916,14 +933,15 @@ namespace ult {
     
     // Prepare a map of default settings
     std::map<std::string, std::string> defaultThemeSettingsMap = {
-        {"default_overlay_color", "#FFFFFF"},
-        {"default_package_color", "#00FF00"},
+        {"default_overlay_color", "FFFFFF"},
+        {"default_package_color", "00FF00"},
+        {"default_script_color", "FF33FF"},
         {"clock_color", whiteColor},
         {"bg_alpha", "13"},
         {"bg_color", blackColor},
         {"separator_alpha", "15"},
-        {"separator_color", "#404040"},
-        {"battery_color", "#ffff45"},
+        {"separator_color", "404040"},
+        {"battery_color", "ffff45"},
         {"text_color", whiteColor},
         {"header_text_color", whiteColor},
         {"header_separator_color", whiteColor},
@@ -932,41 +950,41 @@ namespace ult {
         {"bottom_button_color", whiteColor},
         {"bottom_text_color", whiteColor},
         {"bottom_separator_color", whiteColor},
-        {"table_bg_color", "#303030"},
+        {"table_bg_color", "303030"},
         {"table_bg_alpha", "10"},
         {"table_section_text_color", whiteColor},
-        {"table_info_text_color", "#00FFDD"},
-        {"warning_text_color", "#FF7777"},
-        {"trackbar_slider_color", "#606060"},
-        {"trackbar_slider_border_color", "#505050"},
-        {"trackbar_slider_malleable_color", "#A0A0A0"},
-        {"trackbar_full_color", "#00FFDD"},
-        {"trackbar_empty_color", "#404040"},
-        {"version_text_color", "#AAAAAA"},
-        {"on_text_color", "#00FFDD"},
-        {"off_text_color", "#AAAAAA"},
-        {"invalid_text_color", "#FF0000"},
-        {"inprogress_text_color", "#FFFF45"},
+        {"table_info_text_color", "00FFDD"},
+        {"warning_text_color", "FF7777"},
+        {"trackbar_slider_color", "606060"},
+        {"trackbar_slider_border_color", "505050"},
+        {"trackbar_slider_malleable_color", "A0A0A0"},
+        {"trackbar_full_color", "00FFDD"},
+        {"trackbar_empty_color", "404040"},
+        {"version_text_color", "AAAAAA"},
+        {"on_text_color", "00FFDD"},
+        {"off_text_color", "AAAAAA"},
+        {"invalid_text_color", "FF0000"},
+        {"inprogress_text_color", "FFFF45"},
         {"selection_text_color", whiteColor},
         {"selection_bg_color", blackColor},
         {"selection_bg_alpha", "13"},
-        {"trackbar_color", "#555555"},
-        {"highlight_color_1", "#2288CC"},
-        {"highlight_color_2", "#88FFFF"},
-        {"highlight_color_3", "#FFFF45"},
-        {"highlight_color_4", "#F7253E"},
+        {"trackbar_color", "555555"},
+        {"highlight_color_1", "2288CC"},
+        {"highlight_color_2", "88FFFF"},
+        {"highlight_color_3", "FFFF45"},
+        {"highlight_color_4", "F7253E"},
         {"click_text_color", whiteColor},
         {"click_alpha", "7"},
-        {"click_color", "#3E25F7"},
+        {"click_color", "3E25F7"},
         {"progress_alpha", "7"},
-        {"progress_color", "#253EF7"},
+        {"progress_color", "253EF7"},
         {"invert_bg_click_color", FALSE_STR},
         {"disable_selection_bg", FALSE_STR},
         {"disable_colorful_logo", FALSE_STR},
         {"logo_color_1", whiteColor},
-        {"logo_color_2", "#FF0000"},
-        {"dynamic_logo_color_1", "#00E669"},
-        {"dynamic_logo_color_2", "#8080EA"}
+        {"logo_color_2", "FF0000"},
+        {"dynamic_logo_color_1", "00E669"},
+        {"dynamic_logo_color_2", "8080EA"}
     };
     
     bool isNumericCharacter(char c) {
