@@ -348,9 +348,15 @@ Together, these flags (-ffunction-sections, -fdata-sections, -Wl,--gc-sections, 
 
 - [Sysmodules](https://github.com/ppkantorski/ovl-sysmodules)
 
+- [sys-clk](https://github.com/ppkantorski/sys-clk)
+
 - [FPSLocker](https://github.com/ppkantorski/FPSLocker)
 
+- [ReverseNX-RT](https://github.com/ppkantorski/ReverseNX-RT) 
+
 - [QuickNTP](https://github.com/ppkantorski/QuickNTP)
+
+- [SysDVR Overlay](https://github.com/ppkantorski/sysdvr-overlay)
 
 - [Fizeau](https://github.com/ppkantorski/Fizeau)
 
