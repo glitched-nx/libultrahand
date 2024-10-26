@@ -51,8 +51,8 @@ namespace ult {
     const std::string OVERLAYS_INI_FILEPATH = SETTINGS_PATH + "overlays.ini";
     const std::string PACKAGES_INI_FILEPATH = SETTINGS_PATH + "packages.ini";
     
-    const std::string ULTRAHAND_REPO_URL = "https://github.com/ppkantorski/Ultrahand-Overlay/";
-    const std::string INCLUDED_THEME_FOLDER_URL = "https://raw.githubusercontent.com/ppkantorski/Ultrahand-Overlay/main/themes/";
+    const std::string ULTRAHAND_REPO_URL = "https://github.com/glitched-nx/Ultrahand-Overlay/";
+    const std::string INCLUDED_THEME_FOLDER_URL = "https://raw.githubusercontent.com/glitched-nx/Ultrahand-Overlay/main/themes/";
     const std::string LATEST_RELEASE_INFO_URL = "https://raw.githubusercontent.com/ppkantorski/Ultrahand-Overlay/main/RELEASE.ini";
     const std::string NX_OVLLOADER_ZIP_URL = "https://github.com/ppkantorski/nx-ovlloader/releases/latest/download/nx-ovlloader.zip";
     const std::string NX_OVLLOADER_PLUS_ZIP_URL = "https://github.com/ppkantorski/nx-ovlloader/releases/latest/download/nx-ovlloader+.zip";
@@ -64,8 +64,8 @@ namespace ult {
     const std::string USE_LOGGING_STR = "use_logging";
     #endif
     
-    const std::string TESLA_COMBO_STR = "L+DDOWN+RS";
-    const std::string ULTRAHAND_COMBO_STR = "ZL+ZR+DDOWN";
+    const std::string TESLA_COMBO_STR = "L+R+PLUS";
+    const std::string ULTRAHAND_COMBO_STR = "L+R+PLUS";
     
     const std::string FUSE_STR = "fuse";
     const std::string TESLA_STR = "tesla";
