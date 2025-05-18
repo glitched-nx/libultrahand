@@ -288,11 +288,21 @@ namespace ult {
         
         // Use your custom getline method instead of std::getline
         while (iss.getline(line, '\n')) {  // Custom getline with newline as the delimiter
+
+            // strip inline C++-style comments
+            auto slashPos = line.find("//");
+            if (slashPos != std::string::npos)
+                line = line.substr(0, slashPos);
+            
+            // strip inline hash comments (but leave full-line # for headers)
+            auto hashPos = line.find('#');
+            if (hashPos != std::string::npos && hashPos > 0)
+                line = line.substr(0, hashPos);
+            
             trim(line);
-            if (line.empty() || line[0] == '#') {
-                continue;
-            }
-    
+            if (line.empty() || line[0] == '#') continue;
+
+
             if (line.find("@flag offset_shift ") == 0) {
                 std::string offsetStr = line.substr(19);
                 offset = (offsetStr.find("0x") == 0 ? std::strtol(offsetStr.c_str(), nullptr, 16) : std::strtol(offsetStr.c_str(), nullptr, 10)) - 0x100;

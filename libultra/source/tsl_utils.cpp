@@ -176,7 +176,9 @@ namespace ult {
     bool internalTouchReleased = true;
     u32 layerEdge = 0;
     bool useRightAlignment = false;
-    bool useSwipeToOpen = false;
+    bool useSwipeToOpen = true;
+    bool useDynamicLogo = true;
+    bool usePageSwap = false;
     bool noClickableItems = false;
     
     
@@ -367,7 +369,7 @@ namespace ult {
     std::string STORAGE = "Storage";
     std::string NOTICE = "Notice";
     std::string UTILIZES = "Utilizes";
-    std::string FREE = "free";
+
     std::string MEMORY_EXPANSION = "Memory Expansion";
     std::string REBOOT_REQUIRED = "*Reboot required.";
     std::string LOCAL_IP = "Local IP";
@@ -381,6 +383,8 @@ namespace ult {
     std::string OVERLAY_VERSIONS = "Overlay Versions";
     std::string PACKAGE_VERSIONS = "Package Versions";
     std::string OPAQUE_SCREENSHOTS = "Opaque Screenshots";
+    std::string PAGE_SWAP = "Page Swap";
+    std::string DYNAMIC_LOGO = "Dynamic Logo";
 
     std::string PACKAGE_INFO = "Package Info";
     std::string _TITLE = "Title";
@@ -408,6 +412,7 @@ namespace ult {
     std::string BOOT_ENTRY = "Boot Entry";
     #endif
 
+    std::string FREE = "free";
 
     std::string DEFAULT_CHAR_WIDTH = "0.33";
     std::string UNAVAILABLE_SELECTION = "Not available";
@@ -545,6 +550,8 @@ namespace ult {
         OVERLAY_VERSIONS = "Overlay Versions";
         PACKAGE_VERSIONS = "Package Versions";
         OPAQUE_SCREENSHOTS = "Opaque Screenshots";
+        PAGE_SWAP = "Page Swap";
+        DYNAMIC_LOGO = "Dynamic Logo";
         ON = "On";
         OFF = "Off";
         PACKAGE_INFO = "Package Info";
@@ -698,7 +705,7 @@ namespace ult {
             {"STORAGE", &STORAGE},
             {"NOTICE", &NOTICE},
             {"UTILIZES", &UTILIZES},
-            {"FREE", &FREE},
+
             {"MEMORY_EXPANSION", &MEMORY_EXPANSION},
             {"REBOOT_REQUIRED", &REBOOT_REQUIRED},
             {"LOCAL_IP", &LOCAL_IP},
@@ -712,6 +719,8 @@ namespace ult {
             {"OVERLAY_VERSIONS", &OVERLAY_VERSIONS},
             {"PACKAGE_VERSIONS", &PACKAGE_VERSIONS},
             {"OPAQUE_SCREENSHOTS", &OPAQUE_SCREENSHOTS},
+            {"PAGE_SWAP", &PAGE_SWAP},
+            {"DYNAMIC_LOGO", &DYNAMIC_LOGO},
 
             {"PACKAGE_INFO", &PACKAGE_INFO},
             {"TITLE", &_TITLE},
@@ -739,7 +748,8 @@ namespace ult {
             {"BOOT_ENTRY", &BOOT_ENTRY},
             #endif
 
-
+            {"FREE", &FREE},
+            
             {"DEFAULT_CHAR_WIDTH", &DEFAULT_CHAR_WIDTH},
             {"UNAVAILABLE_SELECTION", &UNAVAILABLE_SELECTION},
 
@@ -955,6 +965,9 @@ namespace ult {
         {"table_section_text_color", whiteColor},
         {"table_info_text_color", "00FFDD"},
         {"warning_text_color", "FF7777"},
+        {"healthy_ram_text_color", "00FF00"},
+        {"neutral_ram_text_color", "FFAA00"},
+        {"bad_ram_text_color", "FF0000"},
         {"trackbar_slider_color", "606060"},
         {"trackbar_slider_border_color", "505050"},
         {"trackbar_slider_malleable_color", "A0A0A0"},
@@ -1176,7 +1189,7 @@ namespace ult {
     
     // Define variables to store previous battery charge and time
     uint32_t prevBatteryCharge = 0;
-    s64 timeOut = 0;
+    //s64 timeOut = 0;
     
     
     uint32_t batteryCharge;

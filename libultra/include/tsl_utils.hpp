@@ -59,6 +59,36 @@
 #define APPROXIMATE_cos(x)       (1 - (x) * (x) / 2 + (x) * (x) * (x) * (x) / 24)  // valid for small x
 #endif
 
+
+#ifndef APPROXIMATE_ifloor
+#define APPROXIMATE_ifloor(x)   ((int)((x) >= 0 ? (x) : (x) - 1))  // truncate toward negative infinity
+#define APPROXIMATE_iceil(x)    ((int)((x) == (int)(x) ? (x) : ((x) > 0 ? (int)(x) + 1 : (int)(x))))  // truncate toward positive infinity
+#endif
+
+#ifndef APPROXIMATE_sqrt
+// Fast approximation for sqrt using Newton's method
+#define APPROXIMATE_sqrt(x)     ((x) <= 0 ? 0 : (x) / 2.0 * (3.0 - ((x) * (x) * 0.5)))  // Approximation for x close to 1
+#define APPROXIMATE_pow(x, y)   ((y) == 0 ? 1 : ((y) == 1 ? (x) : APPROXIMATE_sqrt(x))) // limited to approximate sqrt if y=0.5
+#endif
+
+#ifndef APPROXIMATE_fmod
+#define APPROXIMATE_fmod(x, y)    ((x) - ((int)((x) / (y)) * (y)))  // equivalent to x - floor(x/y) * y
+#endif
+
+#ifndef APPROXIMATE_cos
+// Approximation for cos(x) using Taylor series around 0
+#define APPROXIMATE_cos(x)       (1 - (x) * (x) / 2 + (x) * (x) * (x) * (x) / 24)  // valid for small x
+#endif
+
+#ifndef APPROXIMATE_acos
+#define APPROXIMATE_acos(x)      (1.5708 - (x) - (x)*(x)*(x) / 6)  // limited approximation for acos in range [-1, 1]
+#endif
+
+#ifndef APPROXIMATE_fabs
+#define APPROXIMATE_fabs(x)      ((x) < 0 ? -(x) : (x))
+#endif
+
+
 namespace ult {
     extern bool correctFrameSize; // for detecting the correct Overlay display size
 
@@ -83,6 +113,8 @@ namespace ult {
     extern u32 layerEdge;
     extern bool useRightAlignment;
     extern bool useSwipeToOpen;
+    extern bool useDynamicLogo;
+    extern bool usePageSwap;
     extern bool noClickableItems;
 
 
@@ -295,7 +327,7 @@ namespace ult {
     extern std::string STORAGE;
     extern std::string NOTICE;
     extern std::string UTILIZES;
-    extern std::string FREE;
+
     extern std::string MEMORY_EXPANSION;
     extern std::string REBOOT_REQUIRED;
     extern std::string LOCAL_IP;
@@ -309,6 +341,8 @@ namespace ult {
     extern std::string OVERLAY_VERSIONS;
     extern std::string PACKAGE_VERSIONS;
     extern std::string OPAQUE_SCREENSHOTS;
+    extern std::string PAGE_SWAP;
+    extern std::string DYNAMIC_LOGO;
 
     extern std::string PACKAGE_INFO;
     extern std::string _TITLE;
@@ -335,6 +369,8 @@ namespace ult {
     extern std::string SHUTDOWN;
     extern std::string BOOT_ENTRY;
     #endif
+
+    extern std::string FREE;
 
     extern std::string DEFAULT_CHAR_WIDTH;
     extern std::string UNAVAILABLE_SELECTION;
@@ -499,7 +535,7 @@ namespace ult {
     
     // Define variables to store previous battery charge and time
     extern uint32_t prevBatteryCharge;
-    extern s64 timeOut;
+    //extern s64 timeOut;
     
     
     extern uint32_t batteryCharge;
