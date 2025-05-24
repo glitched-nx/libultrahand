@@ -5213,6 +5213,17 @@ namespace tsl {
             #endif
         };
         
+        class MiniToggleListItem : public ToggleListItem {
+        public:
+            // Constructor for MiniToggleListItem, with no `isMini` boolean.
+            MiniToggleListItem(const std::string& text, bool initialState, const std::string& onValue = ult::ON, const std::string& offValue = ult::OFF)
+                : ToggleListItem(text, initialState, onValue, offValue, true) {
+            }
+            
+            // Destructor if needed (inherits default behavior from ListItem)
+            virtual ~MiniToggleListItem() {}
+        };
+
 
         class DummyListItem : public ListItem {
         public:
