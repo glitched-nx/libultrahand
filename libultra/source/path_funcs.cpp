@@ -442,8 +442,13 @@ namespace ult {
                 name = entry->d_name;
                 if (name == "." || name == "..") continue;
     
-                fullPathSrc = currentSource + '/' + name;
-                fullPathDst = currentDestination + '/' + name;
+                fullPathSrc = (!currentSource.empty() && currentSource.back() == '/' 
+                               ? currentSource.substr(0, currentSource.size() - 1) 
+                               : currentSource) + "/" + name;
+                
+                fullPathDst = (!currentDestination.empty() && currentDestination.back() == '/' 
+                               ? currentDestination.substr(0, currentDestination.size() - 1) 
+                               : currentDestination) + "/" + name;
     
                 if (entry->d_type == DT_DIR) {
                     if (mkdir(fullPathDst.c_str(), 0777) != 0 && errno != EEXIST) {
@@ -679,7 +684,7 @@ namespace ult {
      */
     void moveFilesOrDirectoriesByPattern(const std::string& sourcePathPattern, const std::string& destinationPath,
         const std::string& logSource, const std::string& logDestination) {
-    
+        
         std::vector<std::string> fileList = getFilesListByWildcards(sourcePathPattern);
         
         //std::string fileListAsString;
@@ -1109,6 +1114,52 @@ namespace ult {
             }
         }
         //fileList.clear();
+    }
+    
+    /**
+     * @brief For each match of the wildcard pattern, creates an empty text file
+     *        named basename.txt inside the output directory.
+     *        Uses FILE* if NO_FSTREAM_DIRECTIVE is defined, otherwise uses std::ofstream.
+     *
+     * @param wildcardPattern A path with a wildcard, such as /some/path/[*].
+     *                        Each match results in a file named after the basename.
+     * @param outputDir       Directory where the output files will be written.
+     *                        Created if it doesn't already exist.
+     */
+    void createFlagFiles(const std::string& wildcardPattern,
+                         const std::string& outputDir)
+    {
+        // 1) Gather all matches from the wildcard pattern
+        std::vector<std::string> allMatches = ult::getFilesListByWildcards(wildcardPattern);
+        if (allMatches.empty()) {
+            return; // No matches, nothing to do
+        }
+    
+        // 2) Ensure the output directory exists
+        createDirectory(outputDir);
+    
+        // 3) Generate empty .txt files for each matched path
+        std::string outputPrefix = outputDir;
+        if (!outputPrefix.empty() && outputPrefix.back() != '/')
+            outputPrefix.push_back('/');
+        
+        std::string baseName, outFile;
+        for (const auto& fullPath : allMatches) {
+            baseName = ult::getNameFromPath(fullPath);
+            if (baseName.empty()) continue;
+    
+            outFile = outputPrefix + baseName;
+    
+        #if defined(NO_FSTREAM_DIRECTIVE)
+            FILE* fp = std::fopen(outFile.c_str(), "wb");
+            if (fp) {
+                std::fclose(fp);
+            }
+        #else
+            std::ofstream ofs(outFile, std::ios::binary | std::ios::trunc);
+            ofs.close();
+        #endif
+        }
     }
     
 }

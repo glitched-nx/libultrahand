@@ -55,34 +55,57 @@ namespace ult {
      * @brief Converts a decimal string to a fixed-width hexadecimal string.
      *
      * @param decimalStr The decimal string to convert.
-     * @param order The number of hex digits to output (must be even for byte alignment).
-     * @return Hex string of exactly 'order' digits, or empty string if value doesn't fit.
+     * @param byteGroupSize The number of hex digits to output (must be even for byte alignment).
+     * @return Hex string of exactly 'byteGroupSize' digits, or empty string if value doesn't fit.
      */
-    std::string decimalToHex(const std::string& decimalStr, int order) {
+    std::string decimalToHex(const std::string& decimalStr, int byteGroupSize) {
         int decimalValue = ult::stoi(decimalStr);
-    
-        // If zero, return all '0's of length = order
-        if (decimalValue == 0) {
-            return std::string(order, '0');
+        if (decimalValue < 0 || byteGroupSize <= 0 || (byteGroupSize % 2) != 0) {
+            // Invalid input: negative number, or byteGroupSize <= 0, or odd byteGroupSize
+            return "";
         }
     
-        // Convert to hex
+        // Special case: zero
+        if (decimalValue == 0) {
+            return std::string(byteGroupSize, '0');
+        }
+    
+        // Convert decimalValue to hex (uppercase, minimal length)
         std::string hex;
-        while (decimalValue > 0) {
-            int remainder = decimalValue % 16;
+        int tempValue = decimalValue;
+        while (tempValue > 0) {
+            int remainder = tempValue % 16;
             char hexChar = (remainder < 10) ? ('0' + remainder) : ('A' + remainder - 10);
             hex.insert(hex.begin(), hexChar);
-            decimalValue /= 16;
+            tempValue /= 16;
         }
     
-        // If hex string too long, can't fit in order digits
-        if ((int)hex.length() > order) {
-            return "";  // too large to encode in given order
+        // Ensure hex length is even by adding leading zero if needed
+        if (hex.length() % 2 != 0) {
+            hex.insert(hex.begin(), '0');
         }
     
-        // Pad with leading zeros if needed
-        hex.insert(0, order - hex.length(), '0');
-        
+        // Minimum size needed to fit hex string
+        size_t hexLen = hex.length();
+    
+        // Adjust minimum byteGroupSize to be at least hexLen
+        size_t minByteGroupSize = std::max(static_cast<size_t>(byteGroupSize), hexLen);
+    
+        // If byteGroupSize was too small, adjust to hex length (must be even)
+        if (minByteGroupSize % 2 != 0) {
+            minByteGroupSize++;
+        }
+    
+        // If minByteGroupSize is less than hex length, number doesn't fit
+        if (minByteGroupSize < hexLen) {
+            return ""; // can't fit
+        }
+    
+        // Pad with leading zeros to match minByteGroupSize
+        if (hexLen < minByteGroupSize) {
+            hex.insert(hex.begin(), minByteGroupSize - hexLen, '0');
+        }
+    
         return hex;
     }
     
@@ -141,22 +164,22 @@ namespace ult {
      * @brief Converts a decimal string to a reversed hexadecimal string.
      *
      * This function takes a decimal string as input, converts it into a hexadecimal
-     * string, and reverses the resulting hexadecimal string in groups of order.
+     * string, and reverses the resulting hexadecimal string in groups of byteGroupSize.
      *
      * @param decimalStr The decimal string to convert.
-     * @param order The grouping order for reversing the hexadecimal string.
+     * @param byteGroupSize The grouping byteGroupSize for reversing the hexadecimal string.
      * @return The reversed hexadecimal string.
      */
-    std::string decimalToReversedHex(const std::string& decimalStr, int order) {
-        std::string hexadecimal = decimalToHex(decimalStr, order);
+    std::string decimalToReversedHex(const std::string& decimalStr, int byteGroupSize) {
+        std::string hexadecimal = decimalToHex(decimalStr, byteGroupSize);
         
-        // Reverse the hexadecimal string in groups of order
+        // Reverse the hexadecimal string in groups of byteGroupSize
         //std::string reversedHex;
-        //for (int i = hexadecimal.length() - order; i >= 0; i -= order) {
-        //    reversedHex += hexadecimal.substr(i, order);
+        //for (int i = hexadecimal.length() - byteGroupSize; i >= 0; i -= byteGroupSize) {
+        //    reversedHex += hexadecimal.substr(i, byteGroupSize);
         //}
         
-        return hexToReversedHex(hexadecimal, order);
+        return hexToReversedHex(hexadecimal);
     }
     
     
