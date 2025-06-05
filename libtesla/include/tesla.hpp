@@ -138,6 +138,8 @@ bool fontCache = true;
 #endif
 
 
+
+
 namespace tsl {
 
     // Constants
@@ -262,6 +264,7 @@ namespace tsl {
         }
     }
 
+    static bool overrideBackButton = false; // for proprerly overriding the automatic "go back" functionality of KEY_B button presses
 
     // Theme color variable definitions
     static bool disableColorfulLogo = false;
@@ -610,8 +613,9 @@ namespace tsl {
          *
          * @param enabled Focus Tesla?
          */
-        static void requestForeground(bool enabled) {
-            ult::currentForeground = enabled;
+        static void requestForeground(bool enabled, bool updateGlobalFlag = true) {
+            if (updateGlobalFlag)
+                ult::currentForeground = enabled;
 
             u64 applicationAruid = 0, appletAruid = 0;
             
@@ -7554,22 +7558,20 @@ namespace tsl {
                 //}
             }
 
-            #if IS_LAUNCHER_DIRECTIVE
-            #else
-
-            //if (currentFocus == nullptr) {
-            if (ult::simulatedBack) {
-                keysDown |= KEY_B;
-                ult::simulatedBack = false;
-                ult::simulatedBackComplete = true;
+            if (!overrideBackButton) {
+                //if (currentFocus == nullptr) {
+                if (ult::simulatedBack) {
+                    keysDown |= KEY_B;
+                    ult::simulatedBack = false;
+                    ult::simulatedBackComplete = true;
+                }
+                if (keysDown & KEY_B) {
+                    if (!currentGui->handleInput(KEY_B,0,{},{},{}))
+                        this->goBack();
+                    return;
+                }
             }
-            if (keysDown & KEY_B) {
-                if (!currentGui->handleInput(KEY_B,0,{},{},{}))
-                    this->goBack();
-                return;
-            }
-            //}
-            #endif
+            
             
             if (!currentFocus && !ult::simulatedBack && ult::simulatedBackComplete && !ult::stillTouching && !ult::runningInterpreter.load(std::memory_order_acquire)) {
                 if (!topElement) return;
@@ -8070,8 +8072,8 @@ namespace tsl {
 
             static u64 lastPollTime = 0;
             static std::string lastTitleID = ult::getTitleIdAsString();
-            static bool resetCheck = false;
-            static u64 resetStartTime = 0;
+            static bool resetCheck = true; // initialize as true
+            static u64 resetStartTime = armGetSystemTick();
 
             while (shData->running) {
             
@@ -8079,7 +8081,7 @@ namespace tsl {
                 elapsedNs = armTicksToNs(now - lastPollTime);
             
                 // Poll Title ID every 3 seconds
-                if (elapsedNs >= 2'000'000'000ULL) {
+                if (!resetCheck && elapsedNs >= 2'000'000'000ULL) {
                     lastPollTime = now;
             
                     currentTitleID = ult::getTitleIdAsString();
@@ -8095,7 +8097,7 @@ namespace tsl {
                     resetElapsedNs = armTicksToNs(now - resetStartTime);
                     if (resetElapsedNs >= 3'000'000'000ULL) {
                         if (shData->overlayOpen && ult::currentForeground) {
-                            hlp::requestForeground(true);
+                            hlp::requestForeground(true, false);
                         }
                         resetCheck = false;
                     }
