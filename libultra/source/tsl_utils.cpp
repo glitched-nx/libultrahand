@@ -40,6 +40,7 @@ namespace ult {
     bool launchingOverlay = false;
     bool currentForeground = false;
 
+
     // Helper function to read file content into a string
     bool readFileContent(const std::string& filePath, std::string& content) {
         #if NO_FSTREAM_DIRECTIVE
@@ -141,36 +142,64 @@ namespace ult {
         return false;  // Not docked (normal mode or handheld)
     }
     
+    //static bool pminfoInitialized = false;
+    //static u64 lastPid = 0;
+    //static u64 lastTid = 0;
+    //
+    //std::string getTitleIdAsString() {
+    //    Result rc;
+    //    u64 pid = 0;
+    //    u64 tid = 0;
+    //
+    //    // Get the current application PID
+    //    rc = pmdmntGetApplicationProcessId(&pid);
+    //    if (R_FAILED(rc) || pid == 0) {
+    //        return NULL_STR;
+    //    }
+    //
+    //    // If it's the same PID as last time, return cached TID
+    //    if (pid == lastPid && lastTid != 0) {
+    //        char cachedTidStr[17];
+    //        snprintf(cachedTidStr, sizeof(cachedTidStr), "%016lX", lastTid);
+    //        return std::string(cachedTidStr);
+    //    }
+    //
+    //    // Initialize pminfo if not already
+    //    if (!pminfoInitialized) {
+    //        rc = pminfoInitialize();
+    //        if (R_FAILED(rc)) {
+    //            return NULL_STR;
+    //        }
+    //        pminfoInitialized = true;
+    //    }
+    //
+    //    // Retrieve the TID (Program ID)
+    //    rc = pminfoGetProgramId(&tid, pid);
+    //    if (R_FAILED(rc)) {
+    //        return NULL_STR;
+    //    }
+    //
+    //    lastPid = pid;
+    //    lastTid = tid;
+    //
+    //    char titleIdStr[17];
+    //    snprintf(titleIdStr, sizeof(titleIdStr), "%016lX", tid);
+    //    return std::string(titleIdStr);
+    //}
+
     std::string getTitleIdAsString() {
-        Result rc;
-        u64 pid = 0;
-        u64 tid = 0;
-    
-        // The Process Management service is initialized before (as per your setup)
-        // Get the current application process ID
-        rc = pmdmntGetApplicationProcessId(&pid);
-        if (R_FAILED(rc)) {
+        u64 pid = 0, tid = 0;
+        if (R_FAILED(pmdmntGetApplicationProcessId(&pid)))
             return NULL_STR;
-        }
-        
-        rc = pminfoInitialize();
-        if (R_FAILED(rc)) {
-            return NULL_STR;
-        }
     
-        // Use pminfoGetProgramId to retrieve the Title ID (Program ID)
-        rc = pminfoGetProgramId(&tid, pid);
-        if (R_FAILED(rc)) {
-            pminfoExit();
+        if (R_FAILED(pmdmntGetProgramId(&tid, pid)))
             return NULL_STR;
-        }
-        pminfoExit();
     
-        // Convert the Title ID to a string and return it
-        char titleIdStr[17];  // 16 characters for the Title ID + null terminator
-        snprintf(titleIdStr, sizeof(titleIdStr), "%016lX", tid);
-        return std::string(titleIdStr);
+        char tidStr[17];
+        snprintf(tidStr, sizeof(tidStr), "%016lX", tid);
+        return std::string(tidStr);
     }
+
     
     std::string lastTitleID;
     bool resetForegroundCheck = false; // initialize as true
@@ -192,11 +221,11 @@ namespace ult {
     //const std::chrono::milliseconds transitionPoint = std::chrono::milliseconds(2000); // Point at which the shortest interval is reached
     
     // Function to interpolate between two durations
-    std::chrono::milliseconds interpolateDuration(std::chrono::milliseconds start, std::chrono::milliseconds end, float t) {
-        using namespace std::chrono;
-        auto interpolated = start.count() + static_cast<long long>((end.count() - start.count()) * t);
-        return milliseconds(interpolated);
-    }
+    //std::chrono::milliseconds interpolateDuration(std::chrono::milliseconds start, std::chrono::milliseconds end, float t) {
+    //    using namespace std::chrono;
+    //    auto interpolated = start.count() + static_cast<long long>((end.count() - start.count()) * t);
+    //    return milliseconds(interpolated);
+    //}
     
     
     
@@ -1204,18 +1233,21 @@ namespace ult {
     
     
     bool powerGetDetails(uint32_t *batteryCharge, bool *isCharging) {
-        static auto last_call = std::chrono::steady_clock::now();
-    
+        static uint64_t last_call_ns = 0;
+        
         // Ensure power system is initialized
         if (!powerInitialized) {
             return false;
         }
-    
-        // Get the current time
-        auto now = std::chrono::steady_clock::now();
-    
+        
+        // Get the current time in nanoseconds
+        uint64_t now_ns = armTicksToNs(armGetSystemTick());
+        
+        // 3 seconds in nanoseconds
+        constexpr uint64_t min_delay_ns = 3000000000ULL;
+        
         // Check if enough time has elapsed or if cache is not initialized
-        bool useCache = (now - last_call <= min_delay) && powerCacheInitialized;
+        bool useCache = (now_ns - last_call_ns <= min_delay_ns) && powerCacheInitialized;
         if (!useCache) {
             PsmChargerType charger = PsmChargerType_Unconnected;
             Result rc = psmGetBatteryChargePercentage(batteryCharge);
@@ -1231,7 +1263,7 @@ namespace ult {
                     powerCacheCharge = *batteryCharge;
                     powerCacheIsCharging = *isCharging;
                     powerCacheInitialized = true;
-                    last_call = now; // Update last call time after successful hardware read
+                    last_call_ns = now_ns; // Update last call time after successful hardware read
                     return true;
                 }
             }
@@ -1250,7 +1282,6 @@ namespace ult {
         // Use cached values if not enough time has passed
         *batteryCharge = powerCacheCharge;
         *isCharging = powerCacheIsCharging;
-
         return true; // Return true as cache is used
     }
     
