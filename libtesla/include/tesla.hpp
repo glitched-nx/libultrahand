@@ -144,9 +144,16 @@ double elapsedTime;
 #endif
 
 
+// Custom variables
+//static bool jumpToListItem = false;
 static bool jumpToTop = false;
 static bool jumpToBottom = false;
 static u32 offsetWidthVar = 112;
+static bool hideHidden = false;
+static std::string g_overlayFilename;;
+static std::string jumpItemName;
+static std::string jumpItemValue;
+
 
 namespace tsl {
 
@@ -3410,7 +3417,7 @@ namespace tsl {
                 if (!ult::hideBattery && ult::batteryCharge > 0) {
                     Color batteryColorToUse = ult::isCharging ? tsl::Color(0x0, 0xF, 0x0, 0xF) : 
                                             (ult::batteryCharge < 20 ? tsl::Color(0xF, 0x0, 0x0, 0xF) : batteryColor);
-                    drawString(chargeString, false, tsl::cfg::FramebufferWidth - calculateStringWidth(chargeString, 20, true) - 22, y_offset, 20, a(batteryColorToUse));
+                    drawString(chargeString, false, tsl::cfg::FramebufferWidth - calculateStringWidth(chargeString, 20, true) - 20, y_offset, 20, a(batteryColorToUse));
                 }
         
                 // Draw PCB and SOC temperatures
@@ -4416,6 +4423,10 @@ namespace tsl {
                 this->m_focused = focused;
                 this->m_clickAnimationProgress = 0;
             }
+
+            virtual bool matchesJumpCriteria(const std::string& jumpText, const std::string& jumpValue) const {
+                return false; // Default implementation for non-ListItem elements
+            }
             
             
             static InputMode getInputMode() { return Element::s_inputMode; }
@@ -4458,8 +4469,12 @@ namespace tsl {
             Element *m_parent = nullptr;
             std::vector<Element*> m_children;
             std::function<bool(u64 keys)> m_clickListener = [](u64) { return false; };
-            
         };
+
+        //static std::vector<Element*> m_lastFrameItems; // for smooth handling of jumpToItem navigation
+        //static bool m_hasValidFrame = false;
+        //static float m_lastFrameOffset = 0.0f;
+        // Static cache with instance validation
         
     #if IS_STATUS_MONITOR_DIRECTIVE
         /**
@@ -5282,34 +5297,40 @@ namespace tsl {
         private:
             Color m_color;
         };
-        
+
+
+        class ListItem; // forward declaration
+
+        static std::vector<Element*> s_lastFrameItems;
+        static bool s_hasValidFrame = false;
+        static float s_lastFrameOffset = 0.0f;
+        static size_t s_cachedInstanceId = 0;
+        static size_t s_nextInstanceId = 1; 
+        static s32 s_cachedTopBound = 0;
+        static s32 s_cachedBottomBound = 0;
+        static s32 s_cachedHeight = 0;
+        static s32 s_cachedListHeight = 0;
+        static s32 s_cachedActualContentBottom = 0;
+        static bool s_shouldDrawScrollbar = false;
+        static u32 s_cachedScrollbarHeight = 0;
+        static u32 s_cachedScrollbarOffset = 0;
+        static u32 s_cachedScrollbarX = 0;
+        static u32 s_cachedScrollbarY = 0;
+
         class List : public Element {
         
         public:
-            List() : Element() {
+            List() : Element(), m_instanceId(generateInstanceId()) {
                 m_isItem = false;
             }
             virtual ~List() {
-                clearItems();
+                
+                if (s_cachedInstanceId == m_instanceId && jumpItemName.empty() ) {
+                    clearItems();
+                    clearStaticCache();
+                }
             }
             
-            // Stack variables for hot path - reused to avoid allocations
-            u32 scrollbarHeight;
-            u32 scrollbarOffset;
-            u32 offset;
-            u32 prevOffset;
-            s32 y;
-            bool handled;
-            u16 i;
-        
-            static constexpr float smoothingFactor = 0.15f;
-            static constexpr float dampingFactor = 0.3f;
-            static constexpr float TABLE_SCROLL_STEP_SIZE = 40.0f;
-        
-            // Simplified table state - just track which table and its scroll position
-            bool isInTable = false;
-            size_t tableIndex = 0;
-            float tableScrollOffset = 0.0f;  // Offset within the table itself
             
             virtual void draw(gfx::Renderer* renderer) override {
                 // Early exit optimizations
@@ -5317,11 +5338,28 @@ namespace tsl {
                     clearItems();
                     return;
                 }
-        
+                
                 // Process pending operations in batch
                 if (!m_itemsToAdd.empty()) addPendingItems();
                 if (!m_itemsToRemove.empty()) removePendingItems();
-                
+
+                static bool checkOnce = true;
+                if (m_pendingJump && !s_hasValidFrame && !jumpItemName.empty() && checkOnce) {
+                    checkOnce = false;
+                    return;
+                } else {
+                    checkOnce = true;
+                }
+
+                if (m_pendingJump && s_hasValidFrame) {
+                    // Render using cached frame state if available
+                    renderCachedFrame(renderer);
+                    clearStaticCache();
+                    return;
+                }
+
+                cacheCurrentFrame();
+
                 // Cache bounds for hot loop
                 const s32 topBound = getTopBound();
                 const s32 bottomBound = getBottomBound();
@@ -5338,29 +5376,39 @@ namespace tsl {
                 }
                 
                 renderer->disableScissoring();
+
+                // FIXED: Check if content actually extends beyond viewport bounds
+                // Calculate the actual bottom position of the last item
+                s32 actualContentBottom = 0;
+                if (!m_items.empty()) {
+                    Element* lastItem = m_items.back();
+                    actualContentBottom = lastItem->getBottomBound() - getTopBound();
+                }
         
                 // Draw scrollbar only when needed
-                if (m_listHeight > height) {
+                if (m_listHeight-20 > height || actualContentBottom-20 > height) {  // -20 fixes the alignment
                     drawScrollbar(renderer, height);
                     updateScrollAnimation();
                 }
+                
             }
         
             virtual void layout(u16 parentX, u16 parentY, u16 parentWidth, u16 parentHeight) override {
                 y = getY() - m_offset;
                 
                 // Calculate total height in single pass
-                m_listHeight = -32;
+                m_listHeight = 9;
                 for (Element* entry : m_items) {
                     m_listHeight += entry->getHeight();
                     entry->setBoundaries(getX(), y, getWidth(), entry->getHeight());
                     entry->invalidate();
                     y += entry->getHeight();
                 }
-                y -= 32;
+                y -= 0;
             }
-                                    
-            virtual bool onTouch(TouchEvent event, s32 currX, s32 currY, s32 prevX, s32 prevY, s32 initialX, s32 initialY) {
+                                                
+            // Fixed onTouch method - prevents controller state corruption
+            virtual bool onTouch(TouchEvent event, s32 currX, s32 currY, s32 prevX, s32 prevY, s32 initialX, s32 initialY) override {
                 // Quick bounds check
                 if (!inBounds(currX, currY)) return false;
                 
@@ -5376,14 +5424,68 @@ namespace tsl {
                     if (prevX && prevY) {
                         m_nextOffset += (prevY - currY);
                         m_nextOffset = std::clamp(m_nextOffset, 0.0f, 
-                            static_cast<float>(m_listHeight - getHeight() + 50));
+                            static_cast<float>(m_listHeight - getHeight()));
+                        
+                        // FIXED: Always detect table state based on current scroll position
+                        // This ensures we're in the correct table context regardless of where we scroll
+                        detectAndEnterTableAtOffset();
                     }
                     return true;
                 }
                 
                 return false;
             }
-        
+            
+            // Fixed syncTableStateFromOffset - only called during controller navigation
+            inline void syncTableStateFromOffset() {
+                // FIXED: Only sync during controller mode to prevent conflicts
+                if (Element::getInputMode() != InputMode::Controller) return;
+                if (!isInTable || tableIndex >= m_items.size()) return;
+                
+                float tableStartPos = calculateTableStartPosition(tableIndex);
+                float relativeOffset = m_offset - tableStartPos;
+                
+                Element* table = m_items[tableIndex];
+                float maxTableScroll = static_cast<float>(table->getHeight() - getHeight());
+                tableScrollOffset = std::clamp(relativeOffset, 0.0f, maxTableScroll);
+            }
+            
+            // Fixed detectAndEnterTableAtOffset - only called during controller navigation
+            inline void detectAndEnterTableAtOffset() {
+                // Always reset first, then detect based on current position
+                //bool wasInTable = isInTable;
+                //size_t oldTableIndex = tableIndex;
+                resetTableState();
+                
+                float currentPos = 0.0f;
+                float itemHeight;
+                
+                float maxTableScroll;
+
+                for (size_t i = 0; i < m_items.size(); ++i) {
+                    itemHeight = static_cast<float>(m_items[i]->getHeight());
+                    
+                    // Check if current offset falls within this item
+                    if (m_offset >= currentPos && m_offset < currentPos + itemHeight) {
+                        m_focusedIndex = i;
+                        
+                        // If this item is a table that can be entered
+                        if (canEnterTable(i)) {
+                            isInTable = true;
+                            tableIndex = i;
+                            tableScrollOffset = m_offset - currentPos;
+                            
+                            // Ensure table scroll offset is within bounds
+                            Element* table = m_items[i];
+                            maxTableScroll = static_cast<float>(table->getHeight() - getHeight());
+                            tableScrollOffset = std::clamp(tableScrollOffset, 0.0f, maxTableScroll);
+                        }
+                        break;
+                    }
+                    currentPos += itemHeight;
+                }
+            }
+
             inline void addItem(Element* element, u16 height = 0, ssize_t index = -1) {
                 if (!element) return;
                 
@@ -5421,15 +5523,25 @@ namespace tsl {
             virtual Element* requestFocus(Element* oldFocus, FocusDirection direction) override {
                 if (m_clearList || !m_itemsToAdd.empty()) return nullptr;
                 
-                // Handle jump requests first - these should be processed immediately
-                if (jumpToTop) {
-                    jumpToTop = false;
-                    return handleJumpToTop(oldFocus);
+                static bool delayedHandle = false;
+
+                // NEW: Handle pending jump to specific item
+                if (m_pendingJump && !delayedHandle) {
+                    delayedHandle = true;
+                    return handleJumpToItem(oldFocus);
+                } else if (m_pendingJump) {
+                    m_pendingJump = false;
+                    delayedHandle = false;
+                    return handleJumpToItem(oldFocus); // needs to be handled 2x for proper rendering
                 }
                 
                 if (jumpToBottom) {
                     jumpToBottom = false;
                     return handleJumpToBottom(oldFocus);
+                }
+                if (jumpToTop) {
+                    jumpToTop = false;
+                    return handleJumpToTop(oldFocus);
                 }
             
                 if (direction == FocusDirection::None) {
@@ -5444,7 +5556,13 @@ namespace tsl {
             
                 return oldFocus;
             }
-            
+
+            inline void jumpToItem(const std::string& text = "", const std::string& value = "") {
+                m_pendingJump = true;
+                m_jumpToText = text;
+                m_jumpToValue = value;
+            }
+                        
             virtual Element* getItemAtIndex(u32 index) {
                 return (m_items.size() <= index) ? nullptr : m_items[index];
             }
@@ -5474,6 +5592,7 @@ namespace tsl {
             }
         
         protected:
+
             std::vector<Element*> m_items;
             u16 m_focusedIndex = 0;
             
@@ -5484,7 +5603,10 @@ namespace tsl {
             std::vector<Element*> m_itemsToRemove;
             std::vector<std::pair<ssize_t, Element*>> m_itemsToAdd;
             std::vector<float> prefixSums;
-        
+            
+            // Instance identification
+            const size_t m_instanceId;
+
             // Enhanced navigation state tracking
             bool m_justWrapped = false;
             bool m_isHolding = false;
@@ -5493,6 +5615,25 @@ namespace tsl {
             static constexpr u64 HOLD_THRESHOLD_NS = 100000000ULL;  // 100ms
         
             size_t actualItemCount = 0;
+
+            // Jump to navigation variables
+            std::string m_jumpToText;
+            std::string m_jumpToValue;
+            bool m_pendingJump = false;
+
+            // Stack variables for hot path - reused to avoid allocations
+            u32 scrollbarHeight;
+            u32 scrollbarOffset;
+            u32 prevOffset;
+        
+            static constexpr float smoothingFactor = 0.15f;
+            static constexpr float dampingFactor = 0.3f;
+            static constexpr float TABLE_SCROLL_STEP_SIZE = 40.0f;
+        
+            // Simplified table state - just track which table and its scroll position
+            bool isInTable = false;
+            size_t tableIndex = 0;
+            float tableScrollOffset = 0.0f;  // Offset within the table itself
             
             enum class NavigationResult {
                 None,
@@ -5505,8 +5646,108 @@ namespace tsl {
             NavigationResult m_lastNavigationResult = NavigationResult::None;
         
         private:
+            // Method to explicitly preserve cache when navigating away
+            void preserveCacheForReturn() {
+                if (m_instanceId == s_cachedInstanceId && s_hasValidFrame) {
+                    // Cache is already preserved for this instance
+                    return;
+                }
+                cacheCurrentFrame();
+            }
         
+            // Method to check if this instance has a valid cached frame
+            bool hasCachedFrame() const {
+                return s_hasValidFrame && s_cachedInstanceId == m_instanceId;
+            }
+
+            static size_t generateInstanceId() {
+                return s_nextInstanceId++;
+            }
+        
+            static void clearStaticCache() {
+                s_lastFrameItems.clear();
+                s_hasValidFrame = false;
+                s_lastFrameOffset = 0.0f;
+                s_cachedInstanceId = 0;
+                s_cachedTopBound = 0;
+                s_cachedBottomBound = 0;
+                s_cachedHeight = 0;
+                s_cachedListHeight = 0;
+                s_cachedActualContentBottom = 0;
+                s_shouldDrawScrollbar = false;
+                s_cachedScrollbarHeight = 0;
+                s_cachedScrollbarOffset = 0;
+                s_cachedScrollbarX = 0;
+                s_cachedScrollbarY = 0;
+            }
+        
+            void cacheCurrentFrame() {
+                s_lastFrameItems = m_items;
+                s_lastFrameOffset = m_offset;
+                s_cachedInstanceId = m_instanceId;
+                
+                // Cache all the bounds and calculations
+                s_cachedTopBound = getTopBound();
+                s_cachedBottomBound = getBottomBound();
+                s_cachedHeight = getHeight();
+                s_cachedListHeight = m_listHeight;
+                
+                s32 actualContentBottom = 0;
+                if (!m_items.empty()) {
+                    Element* lastItem = m_items.back();
+                    actualContentBottom = lastItem->getBottomBound() - s_cachedTopBound;
+                }
+                s_cachedActualContentBottom = actualContentBottom;
+                
+                // Cache scrollbar parameters
+                s_shouldDrawScrollbar = (s_cachedListHeight-20 > s_cachedHeight || s_cachedActualContentBottom-20 > s_cachedHeight);
+                
+                if (s_shouldDrawScrollbar) {
+                    const float viewHeight = static_cast<float>(s_cachedHeight - 10);
+                    const float totalHeight = static_cast<float>(s_cachedListHeight-22);
+                    const u32 maxScrollableHeight = std::max(static_cast<u32>(totalHeight - viewHeight), 1u);
+                    
+                    s_cachedScrollbarHeight = std::min(static_cast<u32>((viewHeight * viewHeight) / totalHeight), 
+                                                     static_cast<u32>(viewHeight));
+                    
+                    s_cachedScrollbarOffset = std::min(static_cast<u32>((m_offset / maxScrollableHeight) * (viewHeight - s_cachedScrollbarHeight)), 
+                                                     static_cast<u32>(viewHeight - s_cachedScrollbarHeight)) + 4;
+            
+                    s_cachedScrollbarX = getRightBound() + 20;
+                    s_cachedScrollbarY = getY() + s_cachedScrollbarOffset + 2;
+                }
+                
+                s_hasValidFrame = true;
+            }
+                        
+            void renderCachedFrame(gfx::Renderer* renderer) {
+                renderer->enableScissoring(getLeftBound(), s_cachedTopBound, getWidth() + 8, s_cachedHeight + 4);
+            
+                for (Element* entry : s_lastFrameItems) {
+                    if (entry->getBottomBound() > s_cachedTopBound && entry->getTopBound() < s_cachedBottomBound) {
+                        entry->frame(renderer);
+                    }
+                }
+                
+                renderer->disableScissoring();
+                
+                //m_offset = s_lastFrameOffset;
+                
+                // Draw cached scrollbar
+                if (s_shouldDrawScrollbar) {
+                    renderer->drawRect(s_cachedScrollbarX, s_cachedScrollbarY, 5, s_cachedScrollbarHeight, a(trackBarColor));
+                    renderer->drawCircle(s_cachedScrollbarX + 2, s_cachedScrollbarY, 2, true, a(trackBarColor));
+                    renderer->drawCircle(s_cachedScrollbarX + 2, s_cachedScrollbarY + s_cachedScrollbarHeight, 2, true, a(trackBarColor));
+                }
+            }
+
+
             inline void clearItems() {
+                // Clear static cache if it belongs to this instance
+                if (s_cachedInstanceId == m_instanceId) {
+                    clearStaticCache();
+                }
+
                 for (Element* item : m_items) delete item;
                 m_items.clear();
                 m_offset = 0;
@@ -5550,8 +5791,8 @@ namespace tsl {
             }
             
             inline void drawScrollbar(gfx::Renderer* renderer, s32 height) {
-                const float viewHeight = static_cast<float>(height - 12);
-                const float totalHeight = static_cast<float>(m_listHeight + 24);
+                const float viewHeight = static_cast<float>(height - 10);
+                const float totalHeight = static_cast<float>(m_listHeight-22);
                 const u32 maxScrollableHeight = std::max(static_cast<u32>(totalHeight - viewHeight), 1u);
                 
                 scrollbarHeight = std::min(static_cast<u32>((viewHeight * viewHeight) / totalHeight), 
@@ -5561,7 +5802,7 @@ namespace tsl {
                                          static_cast<u32>(viewHeight - scrollbarHeight)) + 4;
         
                 const u32 scrollbarX = getRightBound() + 20;
-                const u32 scrollbarY = getY() + scrollbarOffset;
+                const u32 scrollbarY = getY() + scrollbarOffset+2;
         
                 renderer->drawRect(scrollbarX, scrollbarY, 5, scrollbarHeight, a(trackBarColor));
                 renderer->drawCircle(scrollbarX + 2, scrollbarY, 2, true, a(trackBarColor));
@@ -5588,36 +5829,52 @@ namespace tsl {
                     prevOffset = m_offset;
                 }
             }
-        
-            inline Element* handleInitialFocus(Element* oldFocus) {
+                                
+            Element* handleInitialFocus(Element* oldFocus) {
                 size_t startIndex = 0;
+                bool shouldDetectTable = false;
+                
+                // Calculate starting index based on current scroll position (original logic)
                 if (!oldFocus) {
                     s32 elementHeight = 0;
                     while (elementHeight < m_offset && startIndex < m_items.size() - 1) {
                         elementHeight += m_items[++startIndex]->getHeight();
                     }
+                    // Only detect table mode if we're resuming from a non-zero scroll position
+                    shouldDetectTable = (m_offset > 0);
                 }
                 
                 resetNavigationState();
                 
-                // Try backward first
-                for (ssize_t j = static_cast<ssize_t>(startIndex); j >= 0; --j) {
-                    Element* newFocus = m_items[j]->requestFocus(oldFocus, FocusDirection::None);
+                // Try to focus items starting from the calculated index
+                for (size_t i = startIndex; i < m_items.size(); ++i) {
+                    Element* newFocus = m_items[i]->requestFocus(oldFocus, FocusDirection::None);
                     if (newFocus && newFocus != oldFocus) {
-                        m_focusedIndex = static_cast<size_t>(j);
-                        updateScrollOffset();
-                        resetTableState();
+                        m_focusedIndex = i;
+                        
+                        // Only detect table mode if we're restoring from a previous scroll position
+                        if (shouldDetectTable) {
+                            detectAndEnterTableAtOffset();
+                        }
+                        
+                        // Only update scroll offset if we're not in a table
+                        if (!isInTable) {
+                            updateScrollOffset();
+                        }
+                        
                         return newFocus;
                     }
                 }
                 
-                // Try forward
-                for (size_t k = startIndex + 1; k < m_items.size(); ++k) {
-                    Element* newFocus = m_items[k]->requestFocus(oldFocus, FocusDirection::None);
+                // If nothing found from startIndex onwards, try from beginning
+                for (size_t i = 0; i < startIndex && i < m_items.size(); ++i) {
+                    Element* newFocus = m_items[i]->requestFocus(oldFocus, FocusDirection::None);
                     if (newFocus && newFocus != oldFocus) {
-                        m_focusedIndex = k;
+                        m_focusedIndex = i;
+                        
+                        // For items before startIndex, we're not restoring position, so no table detection
                         updateScrollOffset();
-                        resetTableState();
+                        
                         return newFocus;
                     }
                 }
@@ -5712,6 +5969,33 @@ namespace tsl {
                 tableIndex = 0;
                 tableScrollOffset = 0.0f;
             }
+
+            inline Element* handleJumpToItem(Element* oldFocus) {
+                resetTableState();
+                resetNavigationState();
+                invalidate();
+            
+                const bool needsScroll = m_listHeight > getHeight();
+                const float viewportThird = needsScroll ? getHeight() / 3.0f : 0.0f;
+                const float maxOffset = needsScroll ? m_listHeight - getHeight() : 0.0f;
+                
+                float h = 0.0f;
+                
+                for (size_t i = 0; i < m_items.size(); ++i) {
+                    m_focusedIndex = i;
+                    
+                    Element* newFocus = m_items[i]->requestFocus(oldFocus, FocusDirection::Down);
+                    if (newFocus && newFocus != oldFocus && m_items[i]->matchesJumpCriteria(m_jumpToText, m_jumpToValue)) {
+                        m_offset = m_nextOffset = needsScroll && i ? std::clamp(h - viewportThird, 0.0f, maxOffset) : 0.0f;
+                        return newFocus;
+                    }
+                    
+                    h += m_items[i]->getHeight();
+                }
+                
+                // No match found
+                return handleInitialFocus(oldFocus);
+            }
         
             // Core navigation logic
             inline Element* navigateDown(Element* oldFocus) {
@@ -5797,7 +6081,7 @@ namespace tsl {
                 
                 Element* table = m_items[tableIndex];
                 // FIXED: Add buffer to ensure we can see the very bottom content
-                float maxScroll = static_cast<float>(table->getHeight() - getHeight() + 50);
+                float maxScroll = static_cast<float>(table->getHeight() - getHeight());
                 return tableScrollOffset < maxScroll && maxScroll > 0;
             }
         
@@ -5810,7 +6094,7 @@ namespace tsl {
                 
                 Element* table = m_items[tableIndex];
                 // FIXED: Same buffer calculation as canScrollTableDown
-                float maxScroll = static_cast<float>(table->getHeight() - getHeight() + 50);
+                float maxScroll = static_cast<float>(table->getHeight() - getHeight());
                 
                 tableScrollOffset = std::min(tableScrollOffset + TABLE_SCROLL_STEP_SIZE, maxScroll);
                 
@@ -5835,7 +6119,7 @@ namespace tsl {
                 return pos;
             }
             
-            inline Element* enterTable(Element* oldFocus, size_t tableIdx, bool fromTop) {
+            Element* enterTable(Element* oldFocus, size_t tableIdx, bool fromTop) {
                 isInTable = true;
                 tableIndex = tableIdx;
                 m_focusedIndex = tableIdx;
@@ -5849,7 +6133,7 @@ namespace tsl {
                 } else {
                     // Enter from bottom - scroll to show the bottom of the table
                     Element* table = m_items[tableIdx];
-                    tableScrollOffset = static_cast<float>(table->getHeight() - getHeight() + 50);
+                    tableScrollOffset = static_cast<float>(table->getHeight() - getHeight());
                     if (tableScrollOffset < 0) tableScrollOffset = 0.0f;
                     
                     // FIXED: Use smooth animation when entering table from bottom
@@ -5860,7 +6144,7 @@ namespace tsl {
                 return oldFocus;
             }
         
-            inline Element* exitTableDown(Element* oldFocus) {
+            Element* exitTableDown(Element* oldFocus) {
                 size_t currentTableIndex = tableIndex;
                 resetTableState();
                 m_focusedIndex = currentTableIndex;
@@ -5879,7 +6163,7 @@ namespace tsl {
                 return oldFocus;
             }
         
-            inline Element* exitTableUp(Element* oldFocus) {
+            Element* exitTableUp(Element* oldFocus) {
                 size_t currentTableIndex = tableIndex;
                 resetTableState();
                 m_focusedIndex = currentTableIndex;
@@ -5921,7 +6205,7 @@ namespace tsl {
                     if (tableIndex >= m_items.size()) return true;
                     
                     Element* table = m_items[tableIndex];
-                    float maxScroll = static_cast<float>(table->getHeight() - getHeight() + 50);
+                    float maxScroll = static_cast<float>(table->getHeight() - getHeight());
                     
                     // Use a small epsilon for floating point comparison
                     bool atTableBottom = (tableScrollOffset >= maxScroll - 1.0f);
@@ -5972,7 +6256,7 @@ namespace tsl {
         
             // Wrapping
             // Fix for the wrapToTop function
-            inline Element* wrapToTop(Element* oldFocus) {
+            Element* wrapToTop(Element* oldFocus) {
                 resetTableState();
                 
                 for (size_t i = 0; i < m_items.size(); ++i) {
@@ -5995,7 +6279,7 @@ namespace tsl {
 
                         
             // Also fix wrapToBottom for consistency
-            inline Element* wrapToBottom(Element* oldFocus) {
+            Element* wrapToBottom(Element* oldFocus) {
                 resetTableState();
                 invalidate();
                 // REMOVED: m_justWrapped = true; // This was causing the issue
@@ -6013,7 +6297,7 @@ namespace tsl {
                             // FIXED: Only set target offset for smooth animation to bottom
                             if (m_listHeight > getHeight()) {
                                 
-                                m_nextOffset = static_cast<float>(m_listHeight - getHeight() + 50);
+                                m_nextOffset = static_cast<float>(m_listHeight - getHeight());
                                 // Don't set m_offset - let updateScrollAnimation() handle the smooth transition
                             }
                             return newFocus;
@@ -6023,10 +6307,10 @@ namespace tsl {
                 
                 return oldFocus;
             }
-                                    
-                        
+            
+            
             // Add these methods to handle jumps with smooth scrolling
-            inline Element* handleJumpToTop(Element* oldFocus) {
+            Element* handleJumpToTop(Element* oldFocus) {
                 if (m_items.empty()) return oldFocus;
                 
                 // Check if already at the top-most focusable item
@@ -6076,7 +6360,7 @@ namespace tsl {
                 return oldFocus;
             }
             
-            inline Element* handleJumpToBottom(Element* oldFocus) {
+            Element* handleJumpToBottom(Element* oldFocus) {
                 if (m_items.empty()) return oldFocus;
                 
                 // Check if already at the bottom-most focusable item
@@ -6102,7 +6386,7 @@ namespace tsl {
                 if (isInTable && tableIndex == lastFocusableIndex) {
                     if (tableIndex < m_items.size()) {
                         Element* table = m_items[tableIndex];
-                        maxScroll = static_cast<float>(table->getHeight() - getHeight() + 50);
+                        maxScroll = static_cast<float>(table->getHeight() - getHeight());
                         if (tableScrollOffset >= maxScroll - 1.0f) {
                             return oldFocus;
                         }
@@ -6119,7 +6403,7 @@ namespace tsl {
                     if (canEnterTable(i)) {
                         // Set target for smooth scroll to bottom position
                         if (m_listHeight > getHeight()) {
-                            m_nextOffset = static_cast<float>(m_listHeight - getHeight() + 50);
+                            m_nextOffset = static_cast<float>(m_listHeight - getHeight());
                         }
                         // Don't set m_offset - let updateScrollAnimation() handle smooth transition
                         Element* newFocus = enterTable(oldFocus, i, false);
@@ -6129,7 +6413,7 @@ namespace tsl {
                         m_focusedIndex = i;
                         // Set target for smooth scroll to bottom position
                         if (m_listHeight > getHeight()) {
-                            m_nextOffset = static_cast<float>(m_listHeight - getHeight() + 50);
+                            m_nextOffset = static_cast<float>(m_listHeight - getHeight());
                         }
                         // Don't set m_offset - let updateScrollAnimation() handle smooth transition
                         Element* newFocus = m_items[i]->requestFocus(oldFocus, FocusDirection::None);
@@ -6178,7 +6462,7 @@ namespace tsl {
                 
                 m_nextOffset = std::clamp(prefixSums[m_focusedIndex] - (getHeight() / 3), 
                                         0.0f, 
-                                        static_cast<float>(m_listHeight - getHeight() + 50));
+                                        static_cast<float>(m_listHeight - getHeight()));
             }
         };
 
@@ -6239,11 +6523,11 @@ namespace tsl {
         
                 // Fast path for non-truncated text
                 if (!m_truncated) [[likely]] {
-                    renderer->drawStringWithColoredSections(m_text, {ult::STAR_SYMBOL + "  "}, this->getX() + 19, this->getY() + 45 - yOffset, 23,
+                    renderer->drawStringWithColoredSections(m_text, {ult::STAR_SYMBOL}, this->getX() + 19, this->getY() + 45 - yOffset, 23,
                         a(m_focused ? (useClickTextColor ? clickTextColor : selectedTextColor) : (useClickTextColor ? clickTextColor : defaultTextColor)),
                         a(m_focused ? starColor : selectionStarColor));
                 } else {
-                    drawTruncatedText(renderer, yOffset, useClickTextColor);
+                    drawTruncatedText(renderer, yOffset, useClickTextColor, {ult::STAR_SYMBOL});
                 }
         
                 if (!m_value.empty()) [[likely]] {
@@ -6293,7 +6577,7 @@ namespace tsl {
                 }
                 return false;
             }
-        
+            
             virtual void setFocused(bool state) override {
                 if (state != m_focused) [[likely]] {
                     m_scroll = false;
@@ -6330,6 +6614,30 @@ namespace tsl {
         
             inline const std::string& getValue() const noexcept {
                 return m_value;
+            }
+
+            virtual bool matchesJumpCriteria(const std::string& jumpText, const std::string& jumpValue) const override {
+                return matchesJumpCriteria(jumpText, jumpValue, true); // Default to exact match
+            }
+
+            virtual bool matchesJumpCriteria(const std::string& jumpText, const std::string& jumpValue, bool exactMatch=true) const {
+                if (jumpText.empty() && jumpValue.empty()) return false;
+                
+                bool textMatches, valueMatches;
+                if (exactMatch) {
+                    textMatches = (m_text == jumpText);
+                    valueMatches = (m_value == jumpValue);
+                } else { // contains check
+                    textMatches = (m_text.find(jumpText) != std::string::npos);
+                    valueMatches = (m_value.find(jumpValue) != std::string::npos);
+                }
+                
+                if (jumpText.empty() && !jumpValue.empty())
+                    return valueMatches;
+                else if (!jumpText.empty() && jumpValue.empty())
+                    return textMatches;
+
+                return (textMatches && valueMatches);
             }
         
         protected:
@@ -6379,15 +6687,17 @@ namespace tsl {
                 }
             }
         
-            void drawTruncatedText(gfx::Renderer* renderer, s32 yOffset, bool useClickTextColor) {
+            void drawTruncatedText(gfx::Renderer* renderer, s32 yOffset, bool useClickTextColor, const std::vector<std::string>& specialSymbols = {}) {
                 if (m_focused) [[likely]] {
                     renderer->enableScissoring(getX() + 6, 97, m_maxWidth + (m_value.empty() ? 49 : 27), tsl::cfg::FramebufferHeight - 170);
-                    renderer->drawString(m_scrollText, false, getX() + 19 - static_cast<s32>(m_scrollOffset), getY() + 45 - yOffset, 23, a(selectedTextColor));
+                    //renderer->drawString(m_scrollText, false, getX() + 19 - static_cast<s32>(m_scrollOffset), getY() + 45 - yOffset, 23, a(selectedTextColor));
+                    renderer->drawStringWithColoredSections(m_scrollText, specialSymbols, getX() + 19 - static_cast<s32>(m_scrollOffset), getY() + 45 - yOffset, 23,
+                        a(useClickTextColor ? clickTextColor : defaultTextColor), a(starColor));
                     renderer->disableScissoring();
                     handleScrolling();
                 } else {
-                    renderer->drawString(m_ellipsisText, false, getX() + 19, getY() + 45 - yOffset, 23,
-                        a(useClickTextColor ? clickTextColor : defaultTextColor));
+                    renderer->drawStringWithColoredSections(m_ellipsisText, specialSymbols, getX() + 19, getY() + 45 - yOffset, 23,
+                        a(useClickTextColor ? clickTextColor : defaultTextColor), a(starColor));
                 }
             }
         
@@ -6599,7 +6909,7 @@ namespace tsl {
                 //const std::string& value = this->m_value;
                 s32 xPosition = this->getX() + this->m_maxWidth + 44 + 3;
                 s32 yPosition = this->getY() + 45 - yOffset;
-                s32 fontSize = 20;
+                const s32 fontSize = 20;
                 //bool isFaint = ;
                 //bool isFocused = this->m_focused;
         
@@ -8591,6 +8901,9 @@ namespace tsl {
         
         bool m_closeOnExit;
         
+        bool isNavigatingBackwards = false;
+        bool justNavigated = false;
+
         /**
          * @brief Initializes the Renderer
          *
@@ -8711,6 +9024,9 @@ namespace tsl {
             static const u64 clickThreshold_ns = 340000000ULL; // 340ms in nanoseconds
             static u64 keyEventInterval_ns = 67000000ULL; // 67ms in nanoseconds
             
+            static bool hasScrolled = false;
+            static void* lastGuiPtr = nullptr;  // Use void* instead
+
             auto& currentGui = this->getCurrentGui();
             //static bool isTopElement = true;
         
@@ -8741,9 +9057,9 @@ namespace tsl {
             if (FullMode && !deactivateOriginalFooter) {
                 if (ult::simulatedBack) {
                     ult::simulatedBack = false;
-                    ult::simulatedBackComplete = true;
                     ult::stillTouching = false;
                     this->goBack();
+                    ult::simulatedBackComplete = true;
                     return;
                 }
             } else {
@@ -8755,30 +9071,49 @@ namespace tsl {
                 if (ult::simulatedBack) {
                     keysDown |= KEY_B;
                     ult::simulatedBack = false;
-                    ult::simulatedBackComplete = true;
                 }
                 if (keysDown & KEY_B) {
-                    if (!currentGui->handleInput(KEY_B,0,{},{},{}))
+                    if (!currentGui->handleInput(KEY_B,0,{},{},{})) {
                         this->goBack();
+                        ult::simulatedBackComplete = true;
+                    }
                     return;
                 }
             }
         #endif
-            
-            if (!currentFocus && !ult::simulatedBack && ult::simulatedBackComplete && !ult::stillTouching && !ult::runningInterpreter.load(std::memory_order_acquire)) {
+
+            // Reset touch state when GUI changes
+            if (currentGui.get() != lastGuiPtr) {  // or just currentGui != lastGuiPtr if it's not a smart pointer
+                hasScrolled = false;
+                oldTouchEvent = elm::TouchEvent::None;
+                oldTouchDetected = false;
+                oldTouchPos = { 0 };
+                initialTouchPos = { 0 };
+                lastGuiPtr = currentGui.get();  // or just currentGui
+            }
+                    
+            if (!currentFocus && !ult::simulatedBack && ult::simulatedBackComplete && !ult::stillTouching && !oldTouchDetected && !ult::runningInterpreter.load(std::memory_order_acquire)) {
                 if (!topElement) return;
                 
                 if (!currentGui->initialFocusSet() || keysDown & (HidNpadButton_AnyUp | HidNpadButton_AnyDown | HidNpadButton_AnyLeft | HidNpadButton_AnyRight)) {
                     currentGui->requestFocus(topElement, FocusDirection::None);
                     currentGui->markInitialFocusSet();
-                    //isTopElement = true;
                 }
             }
+            if (isNavigatingBackwards && !currentFocus && topElement && keysDown & (HidNpadButton_AnyUp | HidNpadButton_AnyDown | HidNpadButton_AnyLeft | HidNpadButton_AnyRight)) {
+                currentGui->requestFocus(topElement, FocusDirection::None);
+                currentGui->markInitialFocusSet();
+                isNavigatingBackwards = false;
+                
+                // Reset navigation timing to prevent fast scrolling
+                buttonPressTime_ns = armTicksToNs(armGetSystemTick());
+                lastKeyEventTime_ns = buttonPressTime_ns;
+                singlePressHandled = false;
+            }
             
-            static bool hasScrolled = false;
         
             if (!currentFocus && !touchDetected && (!oldTouchDetected || oldTouchEvent == elm::TouchEvent::Scroll)) {
-                if (!ult::simulatedBack && ult::simulatedBackComplete && topElement) {
+                if (!(isNavigatingBackwards) && !ult::simulatedBack && ult::simulatedBackComplete && topElement) {
                     if (oldTouchEvent == elm::TouchEvent::Scroll) {
                         hasScrolled = true;
                     }
@@ -8800,7 +9135,7 @@ namespace tsl {
             if (currentGui != this->getCurrentGui()) return;
             
             handled |= currentGui->handleInput(keysDown, keysHeld, touchPos, joyStickPosLeft, joyStickPosRight);
-        
+            
             if (hasScrolled) {
                 bool singleArrowKeyPress = ((keysHeld & KEY_UP) != 0) + ((keysHeld & KEY_DOWN) != 0) + ((keysHeld & KEY_LEFT) != 0) + ((keysHeld & KEY_RIGHT) != 0) == 1;
                 
@@ -8809,6 +9144,7 @@ namespace tsl {
                     buttonPressTime_ns = currentTime_ns;
                     lastKeyEventTime_ns = currentTime_ns;
                     hasScrolled = false;
+                    isNavigatingBackwards = false;
                 }
             } else {
                 if (!touchDetected && !oldTouchDetected && !handled && currentFocus && !ult::stillTouching && !ult::runningInterpreter.load(std::memory_order_acquire)) {
@@ -8846,9 +9182,9 @@ namespace tsl {
                         }
         
                         // Calculate transition factor (t) from 0 to 1 based on how far we are from the transition point
-                        const u64 transitionPoint_ns = 2000000000ULL; // 2000ms in nanoseconds
-                        const u64 initialInterval_ns = 67000000ULL;   // 67ms in nanoseconds
-                        const u64 shortInterval_ns = 10000000ULL;     // 10ms in nanoseconds
+                        static const u64 transitionPoint_ns = 2000000000ULL; // 2000ms in nanoseconds
+                        static const u64 initialInterval_ns = 67000000ULL;   // 67ms in nanoseconds
+                        static const u64 shortInterval_ns = 10000000ULL;     // 10ms in nanoseconds
                         
                         float t = (durationSincePress_ns >= transitionPoint_ns) ? 1.0f : 
                                  (float)durationSincePress_ns / (float)transitionPoint_ns;
@@ -8886,16 +9222,10 @@ namespace tsl {
             }
             
             if (!touchDetected && (keysDown & KEY_L) && !(keysHeld & ~KEY_L & ALL_KEYS_MASK) && !ult::runningInterpreter.load(std::memory_order_acquire)) {
-                //if (!isTopElement)
-                //    currentGui->requestFocus(topElement, FocusDirection::None);
-                //isTopElement = true;
                 jumpToTop = true;
                 currentGui->requestFocus(topElement, FocusDirection::None);
             }
             if (!touchDetected && (keysDown & KEY_R) && !(keysHeld & ~KEY_R & ALL_KEYS_MASK) && !ult::runningInterpreter.load(std::memory_order_acquire)) {
-                //if (!isTopElement)
-                //    currentGui->requestFocus(topElement, FocusDirection::None);
-                //isTopElement = true;
                 jumpToBottom = true;
                 currentGui->requestFocus(topElement, FocusDirection::None);
             }
@@ -9034,7 +9364,7 @@ namespace tsl {
             if (this->m_guiStack.top() != nullptr && this->m_guiStack.top()->m_focusedElement != nullptr)
                 this->m_guiStack.top()->m_focusedElement->resetClickAnimation();
             
-            
+            isNavigatingBackwards = false;
             // Create the top element of the new Gui
             gui->m_topElement = gui->createUI();
 
@@ -9064,6 +9394,7 @@ namespace tsl {
          * @note The Overlay gets closes once there are no more Guis on the stack
          */
         void goBack() {
+            isNavigatingBackwards = true;
             if (!this->m_closeOnExit && this->m_guiStack.size() == 1) {
                 this->hide();
                 return;
@@ -9077,6 +9408,7 @@ namespace tsl {
         }
 
         void pop() {
+            isNavigatingBackwards = true;
             if (!this->m_guiStack.empty())
                 this->m_guiStack.pop();
         }
@@ -9125,14 +9457,29 @@ namespace tsl {
         static void parseOverlaySettings() {
             hlp::ini::IniData parsedConfig = hlp::ini::readOverlaySettings(ULTRAHAND_CONFIG_FILE);
             
-            u64 decodedKeys = hlp::comboStringToKeys(parsedConfig[ult::ULTRAHAND_PROJECT_NAME][ult::KEY_COMBO_STR]); // CUSTOM MODIFICATION
-            if (decodedKeys)
+            // Get combo string and check if it's valid before decoding
+            std::string comboStr = parsedConfig[ult::ULTRAHAND_PROJECT_NAME][ult::KEY_COMBO_STR];
+            ult::removeQuotes(comboStr);
+            
+            u64 decodedKeys = 0;
+            if (!comboStr.empty()) {
+                decodedKeys = hlp::comboStringToKeys(comboStr);
+            }
+            
+            if (decodedKeys) {
                 tsl::cfg::launchCombo = decodedKeys;
-            else {
+            } else {
+                // Try Tesla config as fallback
                 parsedConfig = hlp::ini::readOverlaySettings(TESLA_CONFIG_FILE);
-                decodedKeys = hlp::comboStringToKeys(parsedConfig["tesla"][ult::KEY_COMBO_STR]);
-                if (decodedKeys)
-                    tsl::cfg::launchCombo = decodedKeys;
+                comboStr = parsedConfig["tesla"][ult::KEY_COMBO_STR];
+                ult::removeQuotes(comboStr);
+                
+                if (!comboStr.empty()) {
+                    decodedKeys = hlp::comboStringToKeys(comboStr);
+                    if (decodedKeys) {
+                        tsl::cfg::launchCombo = decodedKeys;
+                    }
+                }
             }
             
             #if USING_WIDGET_DIRECTIVE
@@ -9158,7 +9505,6 @@ namespace tsl {
             ult::removeQuotes(hideSOCTempStr);
             ult::hideSOCTemp = hideSOCTempStr != ult::FALSE_STR;
             #endif
-            
         }
 
         /**
@@ -9402,33 +9748,51 @@ namespace tsl {
                         // Make sure this isn't a subset of the main launch combos
                         bool isMainComboMatch = shData->keysHeld == tsl::cfg::launchCombo;
                         //bool isMainCombo2Match = shData->keysHeld == tsl::cfg::launchCombo2;
-
                         if (!isMainComboMatch) {
                             std::string overlayPath = tsl::hlp::getOverlayForKeyCombo(shData->keysHeld);
                             if (!overlayPath.empty() && (shData->keysHeld)) {
                                 // Validate overlay file exists
                                 if (ult::isFileOrDirectory(overlayPath)) {
-                                    ult::launchingOverlay = true;
-                                    //svcSleepThread(500'000'000); // 50ms delay
-                                    // Get overlay settings
                                     std::string overlayFileName = ult::getNameFromPath(overlayPath);
-                                    std::string useOverlayLaunchArgs = ult::parseValueFromIniSection(ult::OVERLAYS_INI_FILEPATH, 
-                                        overlayFileName, ult::USE_LAUNCH_ARGS_STR);
-                                    std::string overlayLaunchArgs = ult::parseValueFromIniSection(ult::OVERLAYS_INI_FILEPATH, 
-                                        overlayFileName, ult::LAUNCH_ARGS_STR);
-                                    ult::removeQuotes(overlayLaunchArgs);
                                     
-                                    // Set the next overlay directly
-                                    if (useOverlayLaunchArgs == ult::TRUE_STR)
-                                        tsl::setNextOverlay(overlayPath, overlayLaunchArgs);
-                                    else
-                                        tsl::setNextOverlay(overlayPath);
+                                    // Check if hideHidden is enabled and if this overlay is hidden
+                                    bool allowLaunch = true;
+                                    if (hideHidden) {
+                                        std::string hideStatus = ult::parseValueFromIniSection(ult::OVERLAYS_INI_FILEPATH, 
+                                            overlayFileName, ult::HIDE_STR);
+                                        if (hideStatus == ult::TRUE_STR) {
+                                            allowLaunch = false; // Block launch for hidden overlays when hideHidden is true
+                                        }
+                                    }
                                     
-                                    // Properly close the overlay to trigger the launch
-                                    tsl::Overlay::get()->close();
-                                    eventFire(&shData->comboEvent);
-                                    break;
-                                    // DON'T set shData->running = false here!
+                                    if (allowLaunch) {
+                                        ult::launchingOverlay = true;
+                                        //svcSleepThread(500'000'000); // 50ms delay
+                                        // Get overlay settings
+                                        std::string useOverlayLaunchArgs = ult::parseValueFromIniSection(ult::OVERLAYS_INI_FILEPATH, 
+                                            overlayFileName, ult::USE_LAUNCH_ARGS_STR);
+                                        std::string overlayLaunchArgs = ult::parseValueFromIniSection(ult::OVERLAYS_INI_FILEPATH, 
+                                            overlayFileName, ult::LAUNCH_ARGS_STR);
+                                        ult::removeQuotes(overlayLaunchArgs);
+                                        // Add --direct argument to launch args
+                                        if (!overlayLaunchArgs.empty()) {
+                                            overlayLaunchArgs += " --direct";
+                                        } else {
+                                            overlayLaunchArgs = "--direct";
+                                        }
+                                        
+                                        // Set the next overlay directly
+                                        if (useOverlayLaunchArgs == ult::TRUE_STR)
+                                            tsl::setNextOverlay(overlayPath, overlayLaunchArgs);
+                                        else
+                                            tsl::setNextOverlay(overlayPath, "--direct");
+
+                                        // Properly close the overlay to trigger the launch
+                                        tsl::Overlay::get()->close();
+                                        eventFire(&shData->comboEvent);
+                                        break;
+                                        // DON'T set shData->running = false here!
+                                    }
                                 }
                             }
                         }
@@ -9505,75 +9869,76 @@ namespace tsl {
     static void pop() {
         Overlay::get()->pop();
     }
-
+        
     
     static void setNextOverlay(const std::string& ovlPath, std::string origArgs) {
-        bool hasSkipCombo = origArgs.find("--skipCombo") != std::string::npos;
-        
-        char buffer[1024]; // Adjust size as needed
+        char buffer[1024];
         char* p = buffer;
         
-        // Store the filename in a string to keep it alive
+        // Store filename and copy it
         std::string filenameStr = ult::getNameFromPath(ovlPath);
         const char* filename = filenameStr.c_str();
-        
-        // Copy filename
         while (*filename) *p++ = *filename++;
         *p++ = ' ';
         
-        // Copy origArgs while filtering --foregroundFix and --lastTitleID
+        // Single-pass argument filtering
         const char* src = origArgs.c_str();
         const char* end = src + origArgs.length();
+        bool hasSkipCombo = false;
         
         while (src < end) {
-            const char* fgPos = strstr(src, "--foregroundFix");
-            const char* titlePos = strstr(src, "--lastTitleID");
-            
-            // Find the earliest flag to remove
-            const char* nextFlag = nullptr;
-            if (fgPos && titlePos) {
-                nextFlag = (fgPos < titlePos) ? fgPos : titlePos;
-            } else if (fgPos) {
-                nextFlag = fgPos;
-            } else if (titlePos) {
-                nextFlag = titlePos;
+            // Skip whitespace
+            while (src < end && *src == ' ') {
+                *p++ = *src++;
             }
             
-            if (nextFlag) {
-                // Copy before flag
-                while (src < nextFlag) *p++ = *src++;
+            if (src >= end) break;
+            
+            // Check for flags to filter/detect
+            if (src[0] == '-' && src[1] == '-') {
                 
-                if (nextFlag == fgPos) {
-                    // Skip "--foregroundFix X"
-                    src = nextFlag + 15; // length of "--foregroundFix"
-                    while (src < end && *src == ' ') src++; // Skip spaces
-                    if (src < end && (*src == '0' || *src == '1')) src++; // Skip single digit
-                } else {
-                    // Skip "--lastTitleID XXXXXXXXXXXXXXXX"
-                    src = nextFlag + 13; // length of "--lastTitleID"
-                    while (src < end && *src == ' ') src++; // Skip spaces
-                    while (src < end && *src != ' ') src++; // Skip title ID value
+                // Check what flag this is
+                if (__builtin_strncmp(src, "--skipCombo", 11) == 0 && (src[11] == ' ' || src[11] == '\0')) {
+                    hasSkipCombo = true;
+                    // Copy this flag
+                    while (src < end && *src != ' ') *p++ = *src++;
                 }
-            } else {
-                // No more flags to filter, copy rest
-                while (src < end) *p++ = *src++;
-                break;
+                else if (__builtin_strncmp(src, "--foregroundFix", 15) == 0) {
+                    // Skip this flag and its value
+                    src += 15;
+                    while (src < end && *src == ' ') src++; // Skip spaces
+                    if (src < end && (*src == '0' || *src == '1')) src++; // Skip value
+                }
+                else if (__builtin_strncmp(src, "--lastTitleID", 13) == 0) {
+                    // Skip this flag and its value
+                    src += 13;
+                    while (src < end && *src == ' ') src++; // Skip spaces
+                    while (src < end && *src != ' ' && *src != '\0') src++; // Skip title ID
+                }
+                else {
+                    // Copy unknown flag
+                    while (src < end && *src != ' ') *p++ = *src++;
+                }
+            }
+            else {
+                // Copy regular argument
+                while (src < end && *src != ' ') *p++ = *src++;
             }
         }
         
-        // Add flags
+        // Add required flags
         if (!hasSkipCombo) {
-            __builtin_memcpy(p, " --skipCombo", 12);
+            memcpy(p, " --skipCombo", 12);
             p += 12;
         }
         
         // Add foreground flag
-        __builtin_memcpy(p, " --foregroundFix ", 17);
+        memcpy(p, " --foregroundFix ", 17);
         p += 17;
         *p++ = (ult::resetForegroundCheck || ult::lastTitleID != ult::getTitleIdAsString()) ? '1' : '0';
         
         // Add last title ID
-        __builtin_memcpy(p, " --lastTitleID ", 15);
+        memcpy(p, " --lastTitleID ", 15);
         p += 15;
         const char* titleId = ult::lastTitleID.c_str();
         while (*titleId) *p++ = *titleId++;
@@ -9584,7 +9949,21 @@ namespace tsl {
     }
     
     
+
+    struct option_entry {
+        const char* name;
+        u8 len;
+        u8 action;
+    };
     
+    static const struct option_entry options[] = {
+        {"direct", 6, 1},
+        {"skipCombo", 9, 2},
+        {"lastTitleID", 11, 3}, 
+        {"foregroundFix", 13, 4}
+    };
+
+
     /**
      * @brief libtesla's main function
      * @note Call it directly from main passing in argc and argv and returning it e.g `return tsl::loop<OverlayTest>(argc, argv);`
@@ -9605,23 +9984,54 @@ namespace tsl {
         const std::string settings = ult::inputExists(ult::SETTINGS_PATH);
     #endif
 
+        if (argc > 0) {
+            //std::string overlayPath = argv[0];
+            g_overlayFilename = ult::getNameFromPath(argv[0]);
+        }
+
         bool skipCombo = false;
+        
         for (u8 arg = 0; arg < argc; arg++) {
             const char* s = argv[arg];
-        
-            if (s[0] == '-' && s[1] == '-') {
-                if (s[2] == 's' && !strcmp(s, "--skipCombo")) {
-                    skipCombo = true;
-                    ult::firstBoot = false;
-                }
-                else if (s[2] == 'f' && !strcmp(s, "--foregroundFix") && arg + 1 < argc) {
-                    ult::resetForegroundCheck = ult::resetForegroundCheck || (argv[++arg][0] == '1'); // Just check for '1'
-                }
-                else if (s[2] == 'l' && !strcmp(s, "--lastTitleID") && arg + 1 < argc) {
-                    const char* providedID = argv[++arg];
-                    if (ult::getTitleIdAsString() != providedID) {
-                        ult::resetForegroundCheck = true;
+            
+            if (s[0] != '-' || s[1] != '-') continue;
+            
+            const char* opt = s + 2;
+            
+            // Check each option directly - memcmp handles both length and content
+            for (u8 i = 0; i < 4; i++) {
+                // memcmp returns 0 for exact match, and checks the null terminator position
+                if (__builtin_memcmp(opt, options[i].name, options[i].len) == 0 && opt[options[i].len] == '\0') {
+                    
+                    switch (options[i].action) {
+                        case 1: // direct
+                            g_overlayFilename = "";
+                            jumpItemName = "";
+                            jumpItemValue = "";
+                            break;
+                            
+                        case 2: // skipCombo  
+                            skipCombo = true;
+                            ult::firstBoot = false;
+                            break;
+                            
+                        case 3: // lastTitleID
+                            if (++arg < argc) {
+                                const char* providedID = argv[arg];
+                                if (ult::getTitleIdAsString() != providedID) {
+                                    ult::resetForegroundCheck = true;
+                                }
+                            }
+                            break;
+                            
+                        case 4: // foregroundFix
+                            if (++arg < argc) {
+                                ult::resetForegroundCheck = ult::resetForegroundCheck || 
+                                                           (argv[arg][0] == '1');
+                            }
+                            break;
                     }
+                    break; // Exit loop once found
                 }
             }
         }
@@ -9653,15 +10063,15 @@ namespace tsl {
 
 
     #if IS_LAUNCHER_DIRECTIVE
-        bool inOverlay;
-        if (ult::inputExists(settings)
-            != "}nwmD9myxpsq9\x7fv~|krkxn9"
-        ) {inOverlay = true; return 0;}
-        else {
-            if (ult::firstBoot)
-                ult::setIniFileValue(ult::ULTRAHAND_CONFIG_INI_PATH, ult::ULTRAHAND_PROJECT_NAME, ult::IN_OVERLAY_STR, ult::FALSE_STR);
-            inOverlay = (ult::parseValueFromIniSection(ult::ULTRAHAND_CONFIG_INI_PATH, ult::ULTRAHAND_PROJECT_NAME, ult::IN_OVERLAY_STR) != ult::FALSE_STR);
-        }
+        //bool inOverlay = true;
+        //if (ult::inputExists(settings)
+        //    != "}nwmD9myxpsq9\x7fv~|krkxn9"
+        //) {inOverlay = true; return 0;}
+        //else {
+        if (ult::firstBoot)
+            ult::setIniFileValue(ult::ULTRAHAND_CONFIG_INI_PATH, ult::ULTRAHAND_PROJECT_NAME, ult::IN_OVERLAY_STR, ult::FALSE_STR);
+        bool inOverlay = (ult::parseValueFromIniSection(ult::ULTRAHAND_CONFIG_INI_PATH, ult::ULTRAHAND_PROJECT_NAME, ult::IN_OVERLAY_STR) != ult::FALSE_STR);
+        //}
 
     #else
         bool inOverlay = true;
