@@ -56,6 +56,7 @@
 #include <functional>
 #include <type_traits>
 #include <mutex>
+#include <shared_mutex>
 #include <memory>
 //#include <chrono>
 #include <list>
@@ -153,7 +154,7 @@ static bool hideHidden = false;
 static std::string g_overlayFilename;;
 static std::string jumpItemName;
 static std::string jumpItemValue;
-
+static bool jumpItemExactMatch = true;
 
 namespace tsl {
 
@@ -318,7 +319,7 @@ namespace tsl {
     static bool disableSelectionBG = false;
     static bool invertBGClickColor = false;
 
-    static size_t selectionBGAlpha = 7;
+    static size_t selectionBGAlpha = 13;
     static Color selectionBGColor = RGB888(ult::blackColor, selectionBGAlpha);
 
     static Color highlightColor1 = RGB888("2288CC");
@@ -534,7 +535,7 @@ namespace tsl {
             CloseOnExit        = BIT(0)     ///< Close the overlay the last Gui gets poped from the stack
         };
         
-        [[maybe_unused]] static constexpr LaunchFlags operator|(LaunchFlags lhs, LaunchFlags rhs) {
+        static constexpr LaunchFlags operator|(LaunchFlags lhs, LaunchFlags rhs) {
             return static_cast<LaunchFlags>(u8(lhs) | u8(rhs));
         }
         
@@ -542,11 +543,11 @@ namespace tsl {
         
     }
     
-    [[maybe_unused]] static void goBack();
+    void goBack(u32 count = 1);
 
-    [[maybe_unused]] static void pop();
+    static void pop(u32 count = 1);
     
-    [[maybe_unused]] static void setNextOverlay(const std::string& ovlPath, std::string args = "");
+    static void setNextOverlay(const std::string& ovlPath, std::string args = "");
     
     template<typename TOverlay, impl::LaunchFlags launchFlags = impl::LaunchFlags::CloseOnExit>
     int loop(int argc, char** argv);
@@ -845,7 +846,7 @@ namespace tsl {
             u64 keys;
 
             for (const auto& [overlayFileName, settings] : overlaysIniData) {
-                auto keyComboIt = settings.find("key_combo");
+                auto keyComboIt = settings.find(ult::KEY_COMBO_STR);
                 if (keyComboIt != settings.end() && !keyComboIt->second.empty()) {
                     keys = hlp::comboStringToKeys(keyComboIt->second);
                     if (keys != 0) {
@@ -878,7 +879,336 @@ namespace tsl {
         };
         
 
-        static float calculateStringWidth(const std::string& originalString, const float fontSize, const bool fixedWidthNumbers); // forward declaration
+        // Forward declarations
+        class Renderer;
+            
+        class FontManager {
+        public:
+            struct Glyph {
+                stbtt_fontinfo *currFont;
+                float currFontSize;
+                int bounds[4];
+                int xAdvance;
+                u8 *glyphBmp;
+                int width, height;
+                
+                // Add destructor to ensure cleanup
+                ~Glyph() {
+                    if (glyphBmp) {
+                        stbtt_FreeBitmap(glyphBmp, nullptr);
+                        glyphBmp = nullptr;
+                    }
+                }
+                
+                // Prevent copying to avoid double-free
+                Glyph(const Glyph&) = delete;
+                Glyph& operator=(const Glyph&) = delete;
+                
+                // Allow moving
+                Glyph(Glyph&& other) noexcept 
+                    : currFont(other.currFont), currFontSize(other.currFontSize)
+                    , xAdvance(other.xAdvance), glyphBmp(other.glyphBmp)
+                    , width(other.width), height(other.height) {
+                    __builtin_memcpy(bounds, other.bounds, sizeof(bounds));
+                    other.glyphBmp = nullptr; // Prevent double-free
+                }
+                
+                Glyph& operator=(Glyph&& other) noexcept {
+                    if (this != &other) {
+                        if (glyphBmp) {
+                            stbtt_FreeBitmap(glyphBmp, nullptr);
+                        }
+                        currFont = other.currFont;
+                        currFontSize = other.currFontSize;
+                        xAdvance = other.xAdvance;
+                        glyphBmp = other.glyphBmp;
+                        width = other.width;
+                        height = other.height;
+                        __builtin_memcpy(bounds, other.bounds, sizeof(bounds));
+                        other.glyphBmp = nullptr;
+                    }
+                    return *this;
+                }
+                
+                Glyph() : currFont(nullptr), currFontSize(0.0f), xAdvance(0), 
+                          glyphBmp(nullptr), width(0), height(0) {
+                    std::memset(bounds, 0, sizeof(bounds));
+                }
+            };
+            
+        private:
+            static std::shared_mutex s_cacheMutex;
+            static std::mutex s_initMutex;
+            
+            // Use unique_ptr to ensure proper cleanup
+            static std::unordered_map<u64, std::unique_ptr<Glyph>> s_sharedGlyphCache;
+            
+            // Add cache size limits
+            static constexpr size_t MAX_CACHE_SIZE = 10000;
+            static constexpr size_t CLEANUP_THRESHOLD = 8000;
+            
+            static stbtt_fontinfo* s_stdFont;
+            static stbtt_fontinfo* s_localFont;
+            static stbtt_fontinfo* s_extFont;
+            static bool s_hasLocalFont;
+            static bool s_initialized;
+            
+            // Fix cache key generation to prevent collisions
+            static u64 generateCacheKey(u32 character, bool monospace, u32 fontSize) {
+                // Use more bits for fontSize and separate monospace bit
+                u64 key = static_cast<u64>(character);
+                key = (key << 32) | static_cast<u64>(fontSize);
+                if (monospace) {
+                    key |= (1ULL << 63); // Use the highest bit for monospace
+                }
+                return key;
+            }
+            
+            // Cleanup old entries when cache gets too large
+            static void cleanupOldEntries() {
+                if (s_sharedGlyphCache.size() <= CLEANUP_THRESHOLD) return;
+                
+                // Simple cleanup: remove oldest entries
+                // In a real implementation, you might want LRU or other strategies
+                size_t toRemove = s_sharedGlyphCache.size() - CLEANUP_THRESHOLD;
+                auto it = s_sharedGlyphCache.begin();
+                for (size_t i = 0; i < toRemove && it != s_sharedGlyphCache.end(); ++i) {
+                    it = s_sharedGlyphCache.erase(it);
+                }
+            }
+            
+        public:
+            static void initializeFonts(stbtt_fontinfo* stdFont, stbtt_fontinfo* localFont, 
+                                      stbtt_fontinfo* extFont, bool hasLocalFont) {
+                std::lock_guard<std::mutex> initLock(s_initMutex);
+                std::unique_lock<std::shared_mutex> cacheLock(s_cacheMutex);
+                
+                s_stdFont = stdFont;
+                s_localFont = localFont;
+                s_extFont = extFont;
+                s_hasLocalFont = hasLocalFont;
+                s_initialized = true;
+            }
+            
+            static stbtt_fontinfo* selectFontForCharacter(u32 character) {
+                std::shared_lock<std::shared_mutex> lock(s_cacheMutex);
+                
+                if (!s_initialized) return nullptr;
+                
+                if (stbtt_FindGlyphIndex(s_extFont, character)) {
+                    return s_extFont;
+                } else if (s_hasLocalFont && stbtt_FindGlyphIndex(s_localFont, character) != 0) {
+                    return s_localFont;
+                }
+                return s_stdFont;
+            }
+            
+            static Glyph* getOrCreateGlyph(u32 character, bool monospace, u32 fontSize) {
+                const u64 key = generateCacheKey(character, monospace, fontSize);
+                
+                // First, try to find existing glyph with shared lock
+                {
+                    std::shared_lock<std::shared_mutex> readLock(s_cacheMutex);
+                    
+                    if (!s_initialized) return nullptr;
+                    
+                    auto it = s_sharedGlyphCache.find(key);
+                    if (it != s_sharedGlyphCache.end()) {
+                        return it->second.get();
+                    }
+                }
+                
+                // Glyph not found, need to create it with exclusive lock
+                std::unique_lock<std::shared_mutex> writeLock(s_cacheMutex);
+                
+                if (!s_initialized) return nullptr;
+                
+                // Double-check pattern
+                auto it = s_sharedGlyphCache.find(key);
+                if (it != s_sharedGlyphCache.end()) {
+                    return it->second.get();
+                }
+                
+                // Check cache size and cleanup if needed
+                if (s_sharedGlyphCache.size() >= MAX_CACHE_SIZE) {
+                    cleanupOldEntries();
+                }
+                
+                // Create new glyph
+                auto glyph = std::make_unique<Glyph>();
+                glyph->currFont = selectFontForCharacterUnsafe(character);
+                if (!glyph->currFont) {
+                    return nullptr;
+                }
+                
+                glyph->currFontSize = stbtt_ScaleForPixelHeight(glyph->currFont, fontSize);
+                
+                stbtt_GetCodepointBitmapBoxSubpixel(glyph->currFont, character, 
+                    glyph->currFontSize, glyph->currFontSize, 0, 0, 
+                    &glyph->bounds[0], &glyph->bounds[1], &glyph->bounds[2], &glyph->bounds[3]);
+                
+                s32 yAdvance = 0;
+                stbtt_GetCodepointHMetrics(glyph->currFont, monospace ? 'W' : character, 
+                                          &glyph->xAdvance, &yAdvance);
+                
+                glyph->glyphBmp = stbtt_GetCodepointBitmap(glyph->currFont, 
+                    glyph->currFontSize, glyph->currFontSize, character, 
+                    &glyph->width, &glyph->height, nullptr, nullptr);
+                
+                Glyph* glyphPtr = glyph.get();
+                s_sharedGlyphCache[key] = std::move(glyph);
+                
+                return glyphPtr;
+            }
+            
+            static void clearCache() {
+                std::unique_lock<std::shared_mutex> cacheLock(s_cacheMutex);
+                s_sharedGlyphCache.clear(); // unique_ptr will handle cleanup
+            }
+            
+            static void cleanup() {
+                std::lock_guard<std::mutex> initLock(s_initMutex);
+                std::unique_lock<std::shared_mutex> cacheLock(s_cacheMutex);
+                
+                s_sharedGlyphCache.clear();
+                s_initialized = false;
+                s_stdFont = nullptr;
+                s_localFont = nullptr;
+                s_extFont = nullptr;
+                s_hasLocalFont = false;
+            }
+            
+            static size_t getCacheSize() {
+                std::shared_lock<std::shared_mutex> lock(s_cacheMutex);
+                return s_sharedGlyphCache.size();
+            }
+            
+            static bool isInitialized() {
+                std::shared_lock<std::shared_mutex> lock(s_cacheMutex);
+                return s_initialized;
+            }
+            
+            // Add memory usage monitoring
+            static size_t getMemoryUsage() {
+                std::shared_lock<std::shared_mutex> lock(s_cacheMutex);
+                size_t totalMemory = 0;
+                for (const auto& pair : s_sharedGlyphCache) {
+                    const auto& glyph = pair.second;
+                    if (glyph && glyph->glyphBmp) {
+                        totalMemory += glyph->width * glyph->height; // Approximate bitmap size
+                    }
+                }
+                return totalMemory;
+            }
+            
+        private:
+            static stbtt_fontinfo* selectFontForCharacterUnsafe(u32 character) {
+                if (!s_initialized) return nullptr;
+                
+                if (stbtt_FindGlyphIndex(s_extFont, character)) {
+                    return s_extFont;
+                } else if (s_hasLocalFont && stbtt_FindGlyphIndex(s_localFont, character) != 0) {
+                    return s_localFont;
+                }
+                return s_stdFont;
+            }
+        };
+        
+        // Static member definitions
+        std::shared_mutex FontManager::s_cacheMutex;
+        std::mutex FontManager::s_initMutex;
+        std::unordered_map<u64, std::unique_ptr<FontManager::Glyph>> FontManager::s_sharedGlyphCache;
+        stbtt_fontinfo* FontManager::s_stdFont = nullptr;
+        stbtt_fontinfo* FontManager::s_localFont = nullptr;
+        stbtt_fontinfo* FontManager::s_extFont = nullptr;
+        bool FontManager::s_hasLocalFont = false;
+        bool FontManager::s_initialized = false;
+        
+        // Updated thread-safe calculateStringWidth function
+        static float calculateStringWidth(const std::string& originalString, const float fontSize, const bool monospace = false) {
+            if (originalString.empty() || !FontManager::isInitialized()) {
+                return 0.0f;
+            }
+            
+            // Thread-safe translation cache access
+            std::string text;
+            #ifdef UI_OVERRIDE_PATH
+            {
+                std::shared_lock<std::shared_mutex> readLock(s_translationCacheMutex);
+                auto translatedIt = ult::translationCache.find(originalString);
+                if (translatedIt != ult::translationCache.end()) {
+                    text = translatedIt->second;
+                } else {
+                    // Need to upgrade to write lock
+                    readLock.unlock();
+                    std::unique_lock<std::shared_mutex> writeLock(s_translationCacheMutex);
+                    
+                    // Double-check pattern
+                    translatedIt = ult::translationCache.find(originalString);
+                    if (translatedIt != ult::translationCache.end()) {
+                        text = translatedIt->second;
+                    } else {
+                        ult::translationCache[originalString] = originalString;
+                        text = originalString;
+                    }
+                }
+            }
+            #else
+            text = originalString;
+            #endif
+            
+            // CRITICAL: Use the same data types as drawString
+            s32 maxWidth = 0;
+            s32 currentLineWidth = 0;
+            ssize_t codepointWidth;
+            u32 currCharacter = 0;
+            
+            // Convert fontSize to u32 to match drawString behavior
+            const u32 fontSizeInt = static_cast<u32>(fontSize);
+            
+            auto itStrEnd = text.cend();
+            auto itStr = text.cbegin();
+            
+            // Fast ASCII check
+            bool isAsciiOnly = true;
+            for (unsigned char c : text) {
+                if (c > 127) {
+                    isAsciiOnly = false;
+                    break;
+                }
+            }
+            
+            while (itStr != itStrEnd) {
+                // Decode UTF-8 codepoint
+                if (isAsciiOnly) {
+                    currCharacter = static_cast<u32>(*itStr);
+                    codepointWidth = 1;
+                } else {
+                    codepointWidth = decode_utf8(&currCharacter, reinterpret_cast<const u8*>(&(*itStr)));
+                    if (codepointWidth <= 0) break;
+                }
+                
+                itStr += codepointWidth;
+                
+                // Handle newlines
+                if (currCharacter == '\n') {
+                    maxWidth = std::max(currentLineWidth, maxWidth);
+                    currentLineWidth = 0;
+                    continue;
+                }
+                
+                // Use u32 fontSize to match drawString - now thread-safe
+                FontManager::Glyph* glyph = FontManager::getOrCreateGlyph(currCharacter, monospace, fontSizeInt);
+                if (!glyph) continue;
+                
+                // CRITICAL: Use the same calculation as drawString
+                currentLineWidth += static_cast<s32>(glyph->xAdvance * glyph->currFontSize);
+            }
+            
+            // Final width calculation
+            maxWidth = std::max(currentLineWidth, maxWidth);
+            return static_cast<float>(maxWidth);
+        }
 
         static std::pair<int, int> getUnderscanPixels();
 
@@ -887,6 +1217,8 @@ namespace tsl {
          */
         class Renderer final {
         public:
+
+            using Glyph = FontManager::Glyph;
 
             Renderer& operator=(Renderer&) = delete;
             
@@ -1356,82 +1688,6 @@ namespace tsl {
                     }
                 }
             }
-
-            //inline void drawQuarterCircle(s32 centerX, s32 centerY, u16 radius, bool filled, const Color& color, int quadrant) {
-            //    s32 x = radius;
-            //    s32 y = 0;
-            //    s32 radiusError = 0;
-            //    s32 xChange = 1 - (radius << 1);
-            //    s32 yChange = 0;
-            //    
-            //    while (x >= y) {
-            //        if (filled) {
-            //            switch (quadrant) {
-            //                case 1: // Top-right
-            //                    for (s32 i = centerX; i <= centerX + x; i++) {
-            //                        this->setPixelBlendDst(i, centerY - y, color);
-            //                    }
-            //                    for (s32 i = centerX; i <= centerX + y; i++) {
-            //                        this->setPixelBlendDst(i, centerY - x, color);
-            //                    }
-            //                    break;
-            //                case 2: // Top-left
-            //                    for (s32 i = centerX - x; i <= centerX; i++) {
-            //                        this->setPixelBlendDst(i, centerY - y, color);
-            //                    }
-            //                    for (s32 i = centerX - y; i <= centerX; i++) {
-            //                        this->setPixelBlendDst(i, centerY - x, color);
-            //                    }
-            //                    break;
-            //                case 3: // Bottom-left
-            //                    for (s32 i = centerX - x; i <= centerX; i++) {
-            //                        this->setPixelBlendDst(i, centerY + y, color);
-            //                    }
-            //                    for (s32 i = centerX - y; i <= centerX; i++) {
-            //                        this->setPixelBlendDst(i, centerY + x, color);
-            //                    }
-            //                    break;
-            //                case 4: // Bottom-right
-            //                    for (s32 i = centerX; i <= centerX + x; i++) {
-            //                        this->setPixelBlendDst(i, centerY + y, color);
-            //                    }
-            //                    for (s32 i = centerX; i <= centerX + y; i++) {
-            //                        this->setPixelBlendDst(i, centerY + x, color);
-            //                    }
-            //                    break;
-            //            }
-            //        } else {
-            //            switch (quadrant) {
-            //                case 1: // Top-right
-            //                    this->setPixelBlendDst(centerX + x, centerY - y, color);
-            //                    this->setPixelBlendDst(centerX + y, centerY - x, color);
-            //                    break;
-            //                case 2: // Top-left
-            //                    this->setPixelBlendDst(centerX - x, centerY - y, color);
-            //                    this->setPixelBlendDst(centerX - y, centerY - x, color);
-            //                    break;
-            //                case 3: // Bottom-left
-            //                    this->setPixelBlendDst(centerX - x, centerY + y, color);
-            //                    this->setPixelBlendDst(centerX - y, centerY + x, color);
-            //                    break;
-            //                case 4: // Bottom-right
-            //                    this->setPixelBlendDst(centerX + x, centerY + y, color);
-            //                    this->setPixelBlendDst(centerX + y, centerY + x, color);
-            //                    break;
-            //            }
-            //        }
-            //        
-            //        y++;
-            //        radiusError += yChange;
-            //        yChange += 2;
-            //        
-            //        if (((radiusError << 1) + xChange) > 0) {
-            //            x--;
-            //            radiusError += xChange;
-            //            xChange += 2;
-            //        }
-            //    }
-            //}
             
             inline void drawBorderedRoundedRect(const s32 x, const s32 y, const s32 width, const s32 height, const s32 thickness, const s32 radius, const Color& highlightColor) {
                 const s32 startX = x + 4;
@@ -2054,1256 +2310,348 @@ namespace tsl {
                 this->fillScreen(Color(0x0, 0x0, 0x0, 0x0)); // Fully transparent
             }
             
-            struct Glyph {
-                stbtt_fontinfo *currFont;
-                float currFontSize;
-                int bounds[4];
-                int xAdvance;
-                u8 *glyphBmp;
-                int width, height;
-            };
+            //struct Glyph {
+            //    stbtt_fontinfo *currFont;
+            //    float currFontSize;
+            //    int bounds[4];
+            //    int xAdvance;
+            //    u8 *glyphBmp;
+            //    int width, height;
+            //};
 
             const stbtt_fontinfo& getStandardFont() const {
                 return m_stdFont;
             }
-            
-            // Ultra-optimized renderTextSegment with extreme performance enhancements
-            // Fixed renderTextSegment that exactly matches original behavior
-            inline void renderTextSegment(const char* textPtr, size_t length, float& currX, float& currY, float& maxX,
-                                          const u32 fontSize, const Color& color, const u64 keyBase,
-                                          std::unordered_map<u64, Glyph>& glyphCache, 
-                                          bool monospace = false, const ssize_t maxWidth = 0, const float startX = 0) {
+                    
+        
+            // Optimized unified drawString method with thread safety
+            inline std::pair<s32, s32> drawString(const std::string& originalString, bool monospace, 
+                                                  const s32 x, const s32 y, const u32 fontSize, 
+                                                  const Color& defaultColor, const ssize_t maxWidth = 0, 
+                                                  bool draw = true,
+                                                  const Color* highlightColor = nullptr,
+                                                  const std::vector<std::string>* specialSymbols = nullptr,
+                                                  const u32 highlightStartChar = 0,
+                                                  const u32 highlightEndChar = 0) {
                 
-                if (length == 0 || color.a == 0x0) [[unlikely]] return;
-                
-                const char* strPtr = textPtr;
-                const char* const strEnd = textPtr + length;
-                
-                // Pre-declare all variables for maximum register usage
-                u32 currCharacter;
-                ssize_t codepointWidth;
-                u64 key;
-                Glyph* glyph;
-                const uint8_t* bmpPtr;
-                float xPos, yPos;
-                s32 width, height;
-                uint8_t alpha;
-                
-                // Ultra-fast ASCII detection using 64-bit word scanning
-                bool isAsciiOnly = true;
-                if (length >= 8) {
-                    const uint64_t* wordPtr = reinterpret_cast<const uint64_t*>(textPtr);
-                    const uint64_t* wordEnd = reinterpret_cast<const uint64_t*>(textPtr + (length & ~7));
-                    
-                    // Check 8 bytes at once for non-ASCII
-                    while (wordPtr < wordEnd) {
-                        if (*wordPtr & 0x8080808080808080ULL) {
-                            isAsciiOnly = false;
-                            break;
-                        }
-                        ++wordPtr;
-                    }
-                    
-                    // Check remaining bytes if still ASCII
-                    if (isAsciiOnly) {
-                        for (size_t i = (length & ~7); i < length; ++i) {
-                            if (static_cast<unsigned char>(textPtr[i]) > 127) {
-                                isAsciiOnly = false;
-                                break;
-                            }
-                        }
-                    }
-                } else {
-                    // For small strings, simple loop
-                    for (size_t i = 0; i < length; ++i) {
-                        if (static_cast<unsigned char>(textPtr[i]) > 127) {
-                            isAsciiOnly = false;
-                            break;
-                        }
-                    }
-                }
-                
-                // Main character processing loop - EXACTLY like original
-                while (strPtr < strEnd) {
-                    // EXACT same maxWidth check as original
-                    if (maxWidth > 0 && (currX - startX) >= maxWidth)
-                        break;
-                    
-                    // Dual-path character decoding
-                    if (isAsciiOnly) [[likely]] {
-                        currCharacter = static_cast<u32>(*strPtr);
-                        ++strPtr;
-                    } else {
-                        codepointWidth = decode_utf8(&currCharacter, reinterpret_cast<const u8*>(strPtr));
-                        if (codepointWidth <= 0) break;
-                        strPtr += codepointWidth;
-                    }
-                    
-                    // EXACT same newline handling as original
-                    if (currCharacter == '\n') {
-                        maxX = std::max(currX, maxX);
-                        currX = startX;
-                        currY += fontSize;
-                        continue;
-                    }
-                    
-                    // Optimized glyph key calculation
-                    key = (static_cast<u64>(currCharacter) << 32) | keyBase;
-                    
-                    // Cache lookup
-                    auto it = glyphCache.find(key);
-                    if (it == glyphCache.end()) {
-                        auto [insertIt, inserted] = glyphCache.emplace(key, Glyph{});
-                        glyph = &insertIt->second;
-                        
-                        // Font selection - same as original
-                        if (stbtt_FindGlyphIndex(&this->m_extFont, currCharacter)) {
-                            glyph->currFont = &this->m_extFont;
-                        } else if (this->m_hasLocalFont && stbtt_FindGlyphIndex(&this->m_stdFont, currCharacter) == 0) {
-                            glyph->currFont = &this->m_localFont;
-                        } else {
-                            glyph->currFont = &this->m_stdFont;
-                        }
-            
-                        const float scaledFontSize = stbtt_ScaleForPixelHeight(glyph->currFont, fontSize);
-                        glyph->currFontSize = scaledFontSize;
-            
-                        stbtt_GetCodepointBitmapBoxSubpixel(glyph->currFont, currCharacter, scaledFontSize, scaledFontSize,
-                                                            0, 0, &glyph->bounds[0], &glyph->bounds[1], &glyph->bounds[2], &glyph->bounds[3]);
-            
-                        s32 yAdvance = 0;
-                        stbtt_GetCodepointHMetrics(glyph->currFont, monospace ? 'W' : currCharacter, &glyph->xAdvance, &yAdvance);
-            
-                        glyph->glyphBmp = stbtt_GetCodepointBitmap(glyph->currFont, scaledFontSize, scaledFontSize, 
-                                                                   currCharacter, &glyph->width, &glyph->height, nullptr, nullptr);
-                    } else {
-                        glyph = &it->second;
-                    }
-                    
-                    // EXACT same rendering condition as original
-                    if (glyph->glyphBmp != nullptr && !std::iswspace(currCharacter) && fontSize > 0 && color.a != 0x0) {
-                        xPos = currX + glyph->bounds[0];
-                        yPos = currY + glyph->bounds[1];
-                        bmpPtr = glyph->glyphBmp;
-                        width = glyph->width;
-                        height = glyph->height;
-                        
-                        s32 col;
-
-                        // Optimized pixel blitting
-                        for (s32 row = 0; row < height; ++row) {
-                            const float currentY = yPos + row;
-                            const uint8_t* rowPtr = bmpPtr + (row * width);
-                            
-                            col = 0;
-                            const s32 simdWidth = width & ~7;
-                            
-                            // Process 8 pixels at once
-                            for (; col < simdWidth; col += 8) {
-                                const uint8_t a0 = rowPtr[col] >> 4;
-                                const uint8_t a1 = rowPtr[col + 1] >> 4;
-                                const uint8_t a2 = rowPtr[col + 2] >> 4;
-                                const uint8_t a3 = rowPtr[col + 3] >> 4;
-                                const uint8_t a4 = rowPtr[col + 4] >> 4;
-                                const uint8_t a5 = rowPtr[col + 5] >> 4;
-                                const uint8_t a6 = rowPtr[col + 6] >> 4;
-                                const uint8_t a7 = rowPtr[col + 7] >> 4;
-                                
-                                const float baseX = xPos + col;
-                                
-                                if (a0 == 0xF) {
-                                    this->setPixel(baseX, currentY, color, this->getPixelOffset(baseX, currentY));
-                                } else if (a0 != 0x0) {
-                                    Color tmpColor = color;
-                                    tmpColor.a = a0;
-                                    this->setPixelBlendDst(baseX, currentY, tmpColor);
-                                }
-                                
-                                if (a1 == 0xF) {
-                                    this->setPixel(baseX + 1, currentY, color, this->getPixelOffset(baseX + 1, currentY));
-                                } else if (a1 != 0x0) {
-                                    Color tmpColor = color;
-                                    tmpColor.a = a1;
-                                    this->setPixelBlendDst(baseX + 1, currentY, tmpColor);
-                                }
-                                
-                                if (a2 == 0xF) {
-                                    this->setPixel(baseX + 2, currentY, color, this->getPixelOffset(baseX + 2, currentY));
-                                } else if (a2 != 0x0) {
-                                    Color tmpColor = color;
-                                    tmpColor.a = a2;
-                                    this->setPixelBlendDst(baseX + 2, currentY, tmpColor);
-                                }
-                                
-                                if (a3 == 0xF) {
-                                    this->setPixel(baseX + 3, currentY, color, this->getPixelOffset(baseX + 3, currentY));
-                                } else if (a3 != 0x0) {
-                                    Color tmpColor = color;
-                                    tmpColor.a = a3;
-                                    this->setPixelBlendDst(baseX + 3, currentY, tmpColor);
-                                }
-                                
-                                if (a4 == 0xF) {
-                                    this->setPixel(baseX + 4, currentY, color, this->getPixelOffset(baseX + 4, currentY));
-                                } else if (a4 != 0x0) {
-                                    Color tmpColor = color;
-                                    tmpColor.a = a4;
-                                    this->setPixelBlendDst(baseX + 4, currentY, tmpColor);
-                                }
-                                
-                                if (a5 == 0xF) {
-                                    this->setPixel(baseX + 5, currentY, color, this->getPixelOffset(baseX + 5, currentY));
-                                } else if (a5 != 0x0) {
-                                    Color tmpColor = color;
-                                    tmpColor.a = a5;
-                                    this->setPixelBlendDst(baseX + 5, currentY, tmpColor);
-                                }
-                                
-                                if (a6 == 0xF) {
-                                    this->setPixel(baseX + 6, currentY, color, this->getPixelOffset(baseX + 6, currentY));
-                                } else if (a6 != 0x0) {
-                                    Color tmpColor = color;
-                                    tmpColor.a = a6;
-                                    this->setPixelBlendDst(baseX + 6, currentY, tmpColor);
-                                }
-                                
-                                if (a7 == 0xF) {
-                                    this->setPixel(baseX + 7, currentY, color, this->getPixelOffset(baseX + 7, currentY));
-                                } else if (a7 != 0x0) {
-                                    Color tmpColor = color;
-                                    tmpColor.a = a7;
-                                    this->setPixelBlendDst(baseX + 7, currentY, tmpColor);
-                                }
-                            }
-                            
-                            // Handle remaining pixels
-                            for (; col < width; ++col) {
-                                alpha = rowPtr[col] >> 4;
-                                if (alpha == 0xF) {
-                                    this->setPixel(xPos + col, currentY, color, this->getPixelOffset(xPos + col, currentY));
-                                } else if (alpha != 0x0) {
-                                    Color tmpColor = color;
-                                    tmpColor.a = alpha;
-                                    this->setPixelBlendDst(xPos + col, currentY, tmpColor);
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Advance cursor - EXACT same as original
-                    currX += static_cast<s32>(glyph->xAdvance * glyph->currFontSize);
-                }
-            }
-            
-            // Optimized drawString that returns EXACTLY the same values as original
-            inline std::pair<s32, s32> drawString(const std::string& originalString, bool monospace, const s32 x, const s32 y, const u32 fontSize, const Color& color, const ssize_t maxWidth = 0) {
-                
+                // Thread-safe translation cache access
+                std::string text;
                 #ifdef UI_OVERRIDE_PATH
-                // Check for translation in the cache
-                auto translatedIt = ult::translationCache.find(originalString);
-                std::string translatedString = (translatedIt != ult::translationCache.end()) ? translatedIt->second : originalString;
-            
-                // Cache the translation if it wasn't already present
-                if (translatedIt == ult::translationCache.end()) {
-                    ult::translationCache[originalString] = translatedString;
-                }
-                const std::string* stringPtr = &translatedString;
-                #else
-                const std::string* stringPtr = &originalString;
-                #endif
-            
-                // Early exit optimizations
-                //if (stringPtr->empty() || fontSize == 0 || color.a == 0x0) {
-                //    return {0, 0};
-                //}
-            
-                // Variable declarations moved outside loops
-                float maxX = x;
-                float currX = x;
-                float currY = y;
-                
-                const auto itStrEnd = stringPtr->cend();
-                auto itStr = stringPtr->cbegin();
-                
-                u32 currCharacter = 0;
-                ssize_t codepointWidth = 0;
-                u64 key = 0;
-                Glyph* glyph = nullptr;
-                
-                float xPos = 0;
-                float yPos = 0;
-                u32 rowOffset = 0;
-                Color tmpColor(0);
-                
-                // Pre-calculate constants
-                const s32 framebufferWidth = static_cast<s32>(cfg::FramebufferWidth);
-                const s32 framebufferHeight = static_cast<s32>(cfg::FramebufferHeight);
-                const s32 maxWidthLimit = x + maxWidth;
-                const bool hasMaxWidth = maxWidth > 0;
-                
-                // Pixel processing variables
-                s32 glyphLeft, glyphTop, glyphRight, glyphBottom;
-                s32 clipLeft, clipTop, clipRight, clipBottom;
-                s32 startX, startY, endX, endY;
-                s32 bmpX, bmpY;
-                s32 simdEnd, vectorEnd;
-                uint8_t alpha;
-                float pixelX, pixelY, baseX;
-                u32 offset;
-                const uint8_t* rowPtr;
-                
-                // Alpha values for SIMD processing
-                uint8_t a0, a1, a2, a3, a4, a5, a6, a7;
-                u32 offset0, offset1, offset2, offset3, offset4, offset5, offset6, offset7;
-                
-                float scaledFontSize;
-                s32 yAdvance = 0;
-                
-                // Static glyph cache
-                static std::unordered_map<u64, Glyph> s_glyphCache;
-                auto cacheIt = s_glyphCache.end();
-            
-                // Ultra-fast ASCII detection for the entire string
-                const size_t strLen = stringPtr->size();
-                bool isAsciiOnly = true;
-                
-                if (strLen >= 8) {
-                    const uint64_t* wordPtr = reinterpret_cast<const uint64_t*>(stringPtr->data());
-                    const uint64_t* wordEnd = reinterpret_cast<const uint64_t*>(stringPtr->data() + (strLen & ~7));
-                    
-                    while (wordPtr < wordEnd) {
-                        if (*wordPtr & 0x8080808080808080ULL) {
-                            isAsciiOnly = false;
-                            break;
-                        }
-                        ++wordPtr;
-                    }
-                    
-                    if (isAsciiOnly) {
-                        for (size_t i = (strLen & ~7); i < strLen; ++i) {
-                            if (static_cast<unsigned char>((*stringPtr)[i]) > 127) {
-                                isAsciiOnly = false;
-                                break;
-                            }
-                        }
-                    }
-                } else {
-                    for (size_t i = 0; i < strLen; ++i) {
-                        if (static_cast<unsigned char>((*stringPtr)[i]) > 127) {
-                            isAsciiOnly = false;
-                            break;
-                        }
-                    }
-                }
-            
-                // Main character processing loop
-                while (itStr != itStrEnd) {
-                    // Early maxWidth check with pre-calculated limit
-                    if (hasMaxWidth && currX >= maxWidthLimit)
-                        break;
-            
-                    // Optimized UTF-8 decoding
-                    if (isAsciiOnly) {
-                        currCharacter = static_cast<u32>(*itStr);
-                        codepointWidth = 1;
-                        ++itStr;
+                {
+                    std::shared_lock<std::shared_mutex> readLock(s_translationCacheMutex);
+                    auto translatedIt = ult::translationCache.find(originalString);
+                    if (translatedIt != ult::translationCache.end()) {
+                        text = translatedIt->second;
                     } else {
-                        codepointWidth = decode_utf8(&currCharacter, reinterpret_cast<const u8*>(&(*itStr)));
-                        if (codepointWidth <= 0)
-                            break;
-                        itStr += codepointWidth;
-                    }
-            
-                    // Newline handling
-                    if (currCharacter == '\n') {
-                        maxX = std::max(currX, maxX);
-                        currX = x;
-                        currY += fontSize;
-                        continue;
-                    }
-            
-                    // Calculate glyph key
-                    key = (static_cast<u64>(currCharacter) << 32) | (static_cast<u64>(monospace) << 31) | static_cast<u64>(fontSize);
-            
-                    // Check cache for the glyph
-                    cacheIt = s_glyphCache.find(key);
-            
-                    // If glyph not found, create and cache it
-                    if (cacheIt == s_glyphCache.end()) {
-                        glyph = &s_glyphCache.emplace(key, Glyph()).first->second;
+                        // Need to upgrade to write lock
+                        readLock.unlock();
+                        std::unique_lock<std::shared_mutex> writeLock(s_translationCacheMutex);
                         
-                        // Determine the appropriate font for the character
-                        if (stbtt_FindGlyphIndex(&this->m_extFont, currCharacter)) {
-                            glyph->currFont = &this->m_extFont;
-                        } else if (this->m_hasLocalFont && stbtt_FindGlyphIndex(&this->m_stdFont, currCharacter) == 0) {
-                            glyph->currFont = &this->m_localFont;
+                        // Double-check pattern
+                        translatedIt = ult::translationCache.find(originalString);
+                        if (translatedIt != ult::translationCache.end()) {
+                            text = translatedIt->second;
                         } else {
-                            glyph->currFont = &this->m_stdFont;
-                        }
-            
-                        scaledFontSize = stbtt_ScaleForPixelHeight(glyph->currFont, fontSize);
-                        glyph->currFontSize = scaledFontSize;
-            
-                        // Get glyph bitmap and metrics
-                        stbtt_GetCodepointBitmapBoxSubpixel(glyph->currFont, currCharacter, scaledFontSize, scaledFontSize,
-                                                            0, 0, &glyph->bounds[0], &glyph->bounds[1], &glyph->bounds[2], &glyph->bounds[3]);
-            
-                        stbtt_GetCodepointHMetrics(glyph->currFont, monospace ? 'W' : currCharacter, &glyph->xAdvance, &yAdvance);
-            
-                        glyph->glyphBmp = stbtt_GetCodepointBitmap(glyph->currFont, scaledFontSize, scaledFontSize, currCharacter, &glyph->width, &glyph->height, nullptr, nullptr);
-                    } else {
-                        glyph = &cacheIt->second;
-                    }
-            
-                    // Rendering with glyph-level bounds checking
-                    if (glyph->glyphBmp != nullptr && !std::iswspace(currCharacter)) {
-                        xPos = currX + glyph->bounds[0];
-                        yPos = currY + glyph->bounds[1];
-            
-                        // Calculate glyph bounds for clipping
-                        glyphLeft = static_cast<s32>(xPos);
-                        glyphTop = static_cast<s32>(yPos);
-                        glyphRight = glyphLeft + glyph->width;
-                        glyphBottom = glyphTop + glyph->height;
-                        
-                        // Early rejection if glyph is completely outside framebuffer
-                        if (glyphRight > 0 && glyphBottom > 0 && glyphLeft < framebufferWidth && glyphTop < framebufferHeight) {
-                            // Calculate clipping bounds
-                            clipLeft = std::max(glyphLeft, 0);
-                            clipTop = std::max(glyphTop, 0);
-                            clipRight = std::min(glyphRight, framebufferWidth);
-                            clipBottom = std::min(glyphBottom, framebufferHeight);
-                            
-                            // Convert back to glyph-relative coordinates
-                            startX = clipLeft - glyphLeft;
-                            startY = clipTop - glyphTop;
-                            endX = clipRight - glyphLeft;
-                            endY = clipBottom - glyphTop;
-            
-                            // Ultra-optimized pixel processing with bounds-safe rendering
-                            for (bmpY = startY; bmpY < endY; ++bmpY) {
-                                rowOffset = bmpY * glyph->width;
-                                rowPtr = glyph->glyphBmp + rowOffset;
-                                pixelY = yPos + bmpY;
-                                
-                                // Process 8 pixels at once for maximum performance
-                                bmpX = startX;
-                                simdEnd = std::min(endX, (startX + 7) & ~7);
-                                
-                                // Handle initial unaligned pixels
-                                for (; bmpX < simdEnd; ++bmpX) {
-                                    alpha = rowPtr[bmpX] >> 4;
-                                    if (alpha != 0x0) {
-                                        pixelX = xPos + bmpX;
-                                        if (alpha == 0xF) {
-                                            offset = this->getPixelOffset(pixelX, pixelY);
-                                            this->setPixel(pixelX, pixelY, color, offset);
-                                        } else {
-                                            tmpColor = color;
-                                            tmpColor.a = alpha;
-                                            this->setPixelBlendDst(pixelX, pixelY, tmpColor);
-                                        }
-                                    }
-                                }
-                                
-                                // Process 8-pixel chunks with unrolled loop
-                                vectorEnd = endX & ~7;
-                                for (; bmpX < vectorEnd; bmpX += 8) {
-                                    // Load 8 alpha values
-                                    a0 = rowPtr[bmpX] >> 4;
-                                    a1 = rowPtr[bmpX + 1] >> 4;
-                                    a2 = rowPtr[bmpX + 2] >> 4;
-                                    a3 = rowPtr[bmpX + 3] >> 4;
-                                    a4 = rowPtr[bmpX + 4] >> 4;
-                                    a5 = rowPtr[bmpX + 5] >> 4;
-                                    a6 = rowPtr[bmpX + 6] >> 4;
-                                    a7 = rowPtr[bmpX + 7] >> 4;
-                                    
-                                    baseX = xPos + bmpX;
-                                    
-                                    // Unrolled pixel processing
-                                    if (a0 != 0x0) {
-                                        if (a0 == 0xF) {
-                                            offset0 = this->getPixelOffset(baseX, pixelY);
-                                            this->setPixel(baseX, pixelY, color, offset0);
-                                        } else {
-                                            tmpColor = color;
-                                            tmpColor.a = a0;
-                                            this->setPixelBlendDst(baseX, pixelY, tmpColor);
-                                        }
-                                    }
-                                    
-                                    if (a1 != 0x0) {
-                                        if (a1 == 0xF) {
-                                            offset1 = this->getPixelOffset(baseX + 1, pixelY);
-                                            this->setPixel(baseX + 1, pixelY, color, offset1);
-                                        } else {
-                                            tmpColor = color;
-                                            tmpColor.a = a1;
-                                            this->setPixelBlendDst(baseX + 1, pixelY, tmpColor);
-                                        }
-                                    }
-                                    
-                                    if (a2 != 0x0) {
-                                        if (a2 == 0xF) {
-                                            offset2 = this->getPixelOffset(baseX + 2, pixelY);
-                                            this->setPixel(baseX + 2, pixelY, color, offset2);
-                                        } else {
-                                            tmpColor = color;
-                                            tmpColor.a = a2;
-                                            this->setPixelBlendDst(baseX + 2, pixelY, tmpColor);
-                                        }
-                                    }
-                                    
-                                    if (a3 != 0x0) {
-                                        if (a3 == 0xF) {
-                                            offset3 = this->getPixelOffset(baseX + 3, pixelY);
-                                            this->setPixel(baseX + 3, pixelY, color, offset3);
-                                        } else {
-                                            tmpColor = color;
-                                            tmpColor.a = a3;
-                                            this->setPixelBlendDst(baseX + 3, pixelY, tmpColor);
-                                        }
-                                    }
-                                    
-                                    if (a4 != 0x0) {
-                                        if (a4 == 0xF) {
-                                            offset4 = this->getPixelOffset(baseX + 4, pixelY);
-                                            this->setPixel(baseX + 4, pixelY, color, offset4);
-                                        } else {
-                                            tmpColor = color;
-                                            tmpColor.a = a4;
-                                            this->setPixelBlendDst(baseX + 4, pixelY, tmpColor);
-                                        }
-                                    }
-                                    
-                                    if (a5 != 0x0) {
-                                        if (a5 == 0xF) {
-                                            offset5 = this->getPixelOffset(baseX + 5, pixelY);
-                                            this->setPixel(baseX + 5, pixelY, color, offset5);
-                                        } else {
-                                            tmpColor = color;
-                                            tmpColor.a = a5;
-                                            this->setPixelBlendDst(baseX + 5, pixelY, tmpColor);
-                                        }
-                                    }
-                                    
-                                    if (a6 != 0x0) {
-                                        if (a6 == 0xF) {
-                                            offset6 = this->getPixelOffset(baseX + 6, pixelY);
-                                            this->setPixel(baseX + 6, pixelY, color, offset6);
-                                        } else {
-                                            tmpColor = color;
-                                            tmpColor.a = a6;
-                                            this->setPixelBlendDst(baseX + 6, pixelY, tmpColor);
-                                        }
-                                    }
-                                    
-                                    if (a7 != 0x0) {
-                                        if (a7 == 0xF) {
-                                            offset7 = this->getPixelOffset(baseX + 7, pixelY);
-                                            this->setPixel(baseX + 7, pixelY, color, offset7);
-                                        } else {
-                                            tmpColor = color;
-                                            tmpColor.a = a7;
-                                            this->setPixelBlendDst(baseX + 7, pixelY, tmpColor);
-                                        }
-                                    }
-                                }
-                                
-                                // Handle remaining pixels
-                                for (; bmpX < endX; ++bmpX) {
-                                    alpha = rowPtr[bmpX] >> 4;
-                                    if (alpha != 0x0) {
-                                        pixelX = xPos + bmpX;
-                                        if (alpha == 0xF) {
-                                            offset = this->getPixelOffset(pixelX, pixelY);
-                                            this->setPixel(pixelX, pixelY, color, offset);
-                                        } else {
-                                            tmpColor = color;
-                                            tmpColor.a = alpha;
-                                            this->setPixelBlendDst(pixelX, pixelY, tmpColor);
-                                        }
-                                    }
-                                }
-                            }
+                            ult::translationCache[originalString] = originalString;
+                            text = originalString;
                         }
                     }
-            
-                    // Advance the cursor for the next glyph
-                    currX += static_cast<s32>(glyph->xAdvance * glyph->currFontSize);
                 }
-            
-                // Final calculation
-                maxX = std::max(currX, maxX);
-                return {maxX - x, currY - y};
-            }
-
-
-            inline std::pair<s32, s32> drawStringWithHighlight(
-                const std::string& text, bool monospace, s32 x, s32 y,
-                const u32 fontSize, const Color& defaultColor, const Color& specialColor,
-                const ssize_t maxWidth = 0
-            ) {
-                // Early exits
-                //if (text.empty() || fontSize <= 0) [[unlikely]] {
-                //    return { 0, 0 };
-                //}
-            
-                // Static glyph cache (shared across all calls)
-                static std::unordered_map<u64, Glyph> s_glyphCache;
+                #else
+                text = originalString;
+                #endif
                 
-                // Pre-declare ALL variables outside loops for maximum optimization
-                const size_t strLen = text.size();
-                float maxX = x;
-                float currX = x;
-                float currY = y;
-                bool inHighlight = false;
+                if (text.empty() || fontSize == 0) return {0, 0};
                 
-                // Iterator variables
-                auto itStrEnd = text.cend();
-                auto itStr = text.cbegin();
-                
-                // Character processing variables
-                u32 currCharacter;
-                ssize_t codepointWidth;
-                u64 key;
-                Glyph* glyph;
-                std::unordered_map<u64, Glyph>::iterator it;
-                std::pair<std::unordered_map<u64, Glyph>::iterator, bool> insertResult;
-                
-                // Font and glyph creation variables
-                float scaledFontSize;
-                s32 yAdvance;
-                
-                // Rendering position variables
-                float xPos, yPos;
-                s32 glyphLeft, glyphTop, glyphRight, glyphBottom;
-                s32 clipLeft, clipTop, clipRight, clipBottom;
-                s32 startX, startY, endX, endY;
-                
-                // Pixel processing variables
-                s32 bmpX, bmpY;
-                u32 rowOffset;
-                const uint8_t* rowPtr;
-                uint8_t bmpColor;
-                Color tmpColor = {0};
-                float pixelX, pixelY;
-                u32 pixelOffset;
-                
-                // Color selection variables
-                const Color* currentColor;
-                
-                // Cursor advance variables
-                float xAdvanceScaled;
-                
-                // Bounds checking variables
-                const s32 fbWidth = static_cast<s32>(cfg::FramebufferWidth);
-                const s32 fbHeight = static_cast<s32>(cfg::FramebufferHeight);
                 const float maxWidthLimit = maxWidth > 0 ? x + maxWidth : std::numeric_limits<float>::max();
                 
-                // Monospace key component
-                const u64 monospaceKey = static_cast<u64>(monospace) << 31;
-                const u64 fontSizeKey = static_cast<u64>(std::bit_cast<u32>(fontSize));
-                const u64 baseKey = monospaceKey | fontSizeKey;
+                // Check if highlighting is enabled (both highlight color and delimiters must be provided)
+                const bool highlightingEnabled = highlightColor && highlightStartChar != 0 && highlightEndChar != 0;
                 
-                // Ultra-fast ASCII detection for the entire string
+                // Fast ASCII check with early exit
                 bool isAsciiOnly = true;
-                if (strLen >= 8) {
-                    const uint64_t* wordPtr = reinterpret_cast<const uint64_t*>(text.data());
-                    const uint64_t* wordEnd = reinterpret_cast<const uint64_t*>(text.data() + (strLen & ~7));
-                    
-                    while (wordPtr < wordEnd) {
-                        if (*wordPtr & 0x8080808080808080ULL) {
-                            isAsciiOnly = false;
-                            break;
-                        }
-                        ++wordPtr;
-                    }
-                    
-                    if (isAsciiOnly) {
-                        const unsigned char* bytePtr = reinterpret_cast<const unsigned char*>(text.data() + (strLen & ~7));
-                        const unsigned char* byteEnd = reinterpret_cast<const unsigned char*>(text.data() + strLen);
-                        while (bytePtr < byteEnd) {
-                            if (*bytePtr > 127) {
-                                isAsciiOnly = false;
-                                break;
-                            }
-                            ++bytePtr;
-                        }
-                    }
-                } else {
-                    const unsigned char* bytePtr = reinterpret_cast<const unsigned char*>(text.data());
-                    const unsigned char* byteEnd = bytePtr + strLen;
-                    while (bytePtr < byteEnd) {
-                        if (*bytePtr > 127) {
-                            isAsciiOnly = false;
-                            break;
-                        }
-                        ++bytePtr;
-                    }
-                }
-            
-                // Main character processing loop with all variables pre-declared
-                while (itStr != itStrEnd) {
-                    // Width boundary check with pre-computed limit
-                    if (currX >= maxWidthLimit) [[unlikely]] {
-                        break;
-                    }
-            
-                    // Optimized UTF-8 decoding
-                    if (isAsciiOnly && *itStr > 0) [[likely]] {
-                        currCharacter = static_cast<u32>(*itStr);
-                        ++itStr;
-                    } else {
-                        codepointWidth = decode_utf8(&currCharacter, reinterpret_cast<const u8*>(&(*itStr)));
-                        if (codepointWidth <= 0) [[unlikely]]
-                            break;
-                        itStr += codepointWidth;
-                    }
-            
-                    // Handle parentheses for highlight state
-                    if (currCharacter == '(') [[unlikely]] {
-                        inHighlight = true;
-                    } else if (currCharacter == ')') [[unlikely]] {
-                        inHighlight = false;
-                    }
-            
-                    // Handle newlines  
-                    if (currCharacter == '\n') [[unlikely]] {
-                        maxX = std::max(currX, maxX);
-                        currX = x;
-                        currY += fontSize;
-                        continue;
-                    }
-            
-                    // Calculate glyph key with pre-computed components
-                    key = (static_cast<u64>(currCharacter) << 32) | baseKey;
-            
-                    // Check cache for the glyph
-                    it = s_glyphCache.find(key);
-            
-                    // If glyph not found, create and cache it
-                    if (it == s_glyphCache.end()) [[unlikely]] {
-                        insertResult = s_glyphCache.emplace(key, Glyph());
-                        glyph = &insertResult.first->second;
-                        
-                        // Determine the appropriate font for the character
-                        if (stbtt_FindGlyphIndex(&this->m_extFont, currCharacter)) {
-                            glyph->currFont = &this->m_extFont;
-                        } else if (this->m_hasLocalFont && stbtt_FindGlyphIndex(&this->m_stdFont, currCharacter) == 0) {
-                            glyph->currFont = &this->m_localFont;
-                        } else {
-                            glyph->currFont = &this->m_stdFont;
-                        }
-            
-                        scaledFontSize = stbtt_ScaleForPixelHeight(glyph->currFont, fontSize);
-                        glyph->currFontSize = scaledFontSize;
-            
-                        // Get glyph bitmap and metrics
-                        stbtt_GetCodepointBitmapBoxSubpixel(glyph->currFont, currCharacter, scaledFontSize, scaledFontSize,
-                                                            0, 0, &glyph->bounds[0], &glyph->bounds[1], &glyph->bounds[2], &glyph->bounds[3]);
-            
-                        yAdvance = 0;
-                        stbtt_GetCodepointHMetrics(glyph->currFont, monospace ? 'W' : currCharacter, &glyph->xAdvance, &yAdvance);
-            
-                        glyph->glyphBmp = stbtt_GetCodepointBitmap(glyph->currFont, scaledFontSize, scaledFontSize, currCharacter, &glyph->width, &glyph->height, nullptr, nullptr);
-                    } else [[likely]] {
-                        glyph = &it->second;
-                    }
-            
-                    // Pre-compute cursor advance
-                    xAdvanceScaled = glyph->xAdvance * glyph->currFontSize;
-            
-                    // Determine color based on highlight state and parentheses
-                    currentColor = (currCharacter == '(' || currCharacter == ')') ? &defaultColor : 
-                                   (inHighlight ? &specialColor : &defaultColor);
-            
-                    // Render the glyph if it's not whitespace with optimized bounds checking
-                    if (glyph->glyphBmp != nullptr && !std::iswspace(currCharacter) && currentColor->a != 0x0) [[likely]] {
-                        xPos = currX + glyph->bounds[0];
-                        yPos = currY + glyph->bounds[1];
-            
-                        // Calculate glyph bounds for clipping with pre-declared variables
-                        glyphLeft = static_cast<s32>(xPos);
-                        glyphTop = static_cast<s32>(yPos);
-                        glyphRight = glyphLeft + glyph->width;
-                        glyphBottom = glyphTop + glyph->height;
-                        
-                        // Early rejection if glyph is completely outside framebuffer
-                        if (glyphRight > 0 && glyphBottom > 0 && glyphLeft < fbWidth && glyphTop < fbHeight) [[likely]] {
-                            
-                            // Calculate clipping bounds with pre-declared variables
-                            clipLeft = std::max(glyphLeft, 0);
-                            clipTop = std::max(glyphTop, 0);
-                            clipRight = std::min(glyphRight, fbWidth);
-                            clipBottom = std::min(glyphBottom, fbHeight);
-                            
-                            // Convert back to glyph-relative coordinates
-                            startX = clipLeft - glyphLeft;
-                            startY = clipTop - glyphTop;
-                            endX = clipRight - glyphLeft;
-                            endY = clipBottom - glyphTop;
-            
-                            // Render clipped pixels with optimized inner loops
-                            for (bmpY = startY; bmpY < endY; ++bmpY) {
-                                rowOffset = bmpY * glyph->width;
-                                rowPtr = glyph->glyphBmp + rowOffset;
-                                pixelY = yPos + bmpY;
-                                
-                                for (bmpX = startX; bmpX < endX; ++bmpX) {
-                                    bmpColor = rowPtr[bmpX] >> 4;
-                                    if (bmpColor != 0x0) {
-                                        pixelX = xPos + bmpX;
-                                        pixelOffset = this->getPixelOffset(pixelX, pixelY);
-                                        if (bmpColor == 0xF) {
-                                            this->setPixel(pixelX, pixelY, *currentColor, pixelOffset);
-                                        } else {
-                                            tmpColor = *currentColor;
-                                            tmpColor.a = bmpColor;
-                                            this->setPixelBlendDst(pixelX, pixelY, tmpColor);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-            
-                    // Advance the cursor for the next glyph
-                    currX += xAdvanceScaled;
-                }
-            
-                // Calculate final dimensions
-                maxX = std::max(currX, maxX);
-                return {static_cast<s32>(maxX - x), static_cast<s32>(currY - y + fontSize)};
-            }
-
-                                    
-            inline void drawStringWithColoredSections(const std::string& text, const std::vector<std::string>& specialSymbols, s32 x, const s32 y, const u32 fontSize, const Color& defaultColor, const Color& specialColor) {
-                // Early exits
-                //if (text.empty() || fontSize <= 0) [[unlikely]] {
-                //    return;
-                //}
-                
-                // Fast path: no special symbols
-                //if (specialSymbols.empty()) [[likely]] {
-                //    drawString(text, false, x, y, fontSize, defaultColor);
-                //    return;
-                //}
-                
-                // Build efficient pattern matcher using Aho-Corasick-like approach
-                // For simplicity, using optimized linear search with memoization
-                
-                // Create sorted symbol list for greedy matching
-                //std::vector<std::string_view> sortedSymbols;
-                //for (const auto& symbol : specialSymbols) {
-                //    if (!symbol.empty()) {
-                //        sortedSymbols.emplace_back(symbol);
-                //    }
-                //}
-                
-                // Sort by length (descending) for longest-first matching
-                //std::sort(sortedSymbols.begin(), sortedSymbols.end(),
-                //          [](const auto& a, const auto& b) { return a.length() > b.length(); });
-                
-                // Initialize rendering state
-                float currX = x;
-                float currY = y;
-                
-                // Pre-calculate constants
-                const u64 keyBase = (static_cast<u64>(false) << 31) | (static_cast<u64>(std::bit_cast<u32>(fontSize)));
-                
-                // Static glyph cache (shared)
-                static std::unordered_map<u64, Glyph> s_glyphCache;
-                static bool s_cacheInitialized = false;
-                if (!s_cacheInitialized) [[unlikely]] {
-                    s_glyphCache.reserve(512);
-                    s_cacheInitialized = true;
-                }
-                
-                // String processing setup
-                const char* strPtr = text.data();
-                const char* const strEnd = strPtr + text.length();
-                const char* currentStart = strPtr;
-                
-                bool foundMatch;
-                size_t matchLength;
-                size_t symLen;
-
-                // Main processing loop
-                while (strPtr < strEnd) {
-                    // Check for special symbol matches at current position
-                    foundMatch = false;
-                    matchLength = 0;
-                    
-                    for (const auto& symbol : specialSymbols) {
-                        //const size_t symLen = symbol.length();
-                        symLen = symbol.length();
-                        
-                        // Check if symbol fits in remaining text
-                        if (strPtr + symLen > strEnd) continue;
-                        
-                        // Fast memory comparison
-                        if (std::memcmp(strPtr, symbol.data(), symLen) == 0) {
-                            foundMatch = true;
-                            matchLength = symLen;
-                            break;
-                        }
-                    }
-                    
-                    if (foundMatch) {
-                        // Render any accumulated normal text
-                        if (strPtr > currentStart) {
-                            renderTextSegment(currentStart, strPtr - currentStart, currX, currY, fontSize, defaultColor, keyBase, s_glyphCache);
-                        }
-                        
-                        // Render special symbol
-                        renderTextSegment(strPtr, matchLength, currX, currY, fontSize, specialColor, keyBase, s_glyphCache);
-                        
-                        // Advance past the special symbol
-                        strPtr += matchLength;
-                        currentStart = strPtr;
-                    } else {
-                        // Move to next character
-                        ++strPtr;
-                    }
-                }
-                
-                // Render any remaining normal text
-                if (strPtr > currentStart) {
-                    renderTextSegment(currentStart, strPtr - currentStart, currX, currY, fontSize, defaultColor, keyBase, s_glyphCache);
-                }
-            }
-                        
-             // Ultra-optimized text segment rendering with all variables hoisted outside loops
-            inline void renderTextSegment(const char* textPtr, size_t length, float& currX, float& currY, 
-                                         const u32 fontSize, const Color& color, const u64 keyBase,
-                                         std::unordered_map<u64, Glyph>& glyphCache) {
-                
-                if (length == 0 || color.a == 0x0) return;
-                
-                // Hoist ALL variable declarations outside loops
-                const char* strPtr = textPtr;
-                const char* const strEnd = textPtr + length;
-                
-                // Character processing variables
-                u32 currCharacter;
-                ssize_t codepointWidth;
-                u64 key;
-                Glyph* glyph;
-                std::unordered_map<u64, Glyph>::iterator it;
-                std::pair<std::unordered_map<u64, Glyph>::iterator, bool> insertResult;
-                
-                // Font and glyph creation variables
-                float scaledFontSize;
-                s32 yAdvance;
-                
-                // Rendering variables
-                s32 xPos, yPos;
-                const uint8_t* bmpPtr;
-                s32 width, height;
-                s32 currentY, currentX;
-                s32 col, row;
-                const s32* bounds;
-                
-                // SIMD processing variables
-                s32 simdWidth;
-                s32 x0, x1, x2, x3;
-                uint8_t c0, c1, c2, c3;
-                uint8_t bmpColor;
-                Color tmpColor = {0};
-                
-                // Cursor advance variable
-                s32 xAdvanceScaled;
-                
-                // Pre-compute ASCII optimization check
-                bool isAsciiOnly = true;
-                const unsigned char* asciiCheckPtr = reinterpret_cast<const unsigned char*>(textPtr);
-                for (size_t i = 0; i < length; ++i) {
-                    if (asciiCheckPtr[i] > 127) {
+                const char* textPtr = text.data();
+                const char* textEnd = textPtr + text.size();
+                for (const char* p = textPtr; p < textEnd; ++p) {
+                    if (static_cast<unsigned char>(*p) > 127) {
                         isAsciiOnly = false;
                         break;
                     }
                 }
                 
-                // Pre-compute framebuffer bounds for faster comparisons
-                const s32 fbWidth = static_cast<s32>(cfg::FramebufferWidth);
-                const s32 fbHeight = static_cast<s32>(cfg::FramebufferHeight);
+                s32 maxX = x, currX = x, currY = y;  // Changed to s32 for consistency
+                s32 maxY = y;                        // Track maximum Y position reached
+                bool inHighlight = false;
+                const Color* currentColor = &defaultColor;
                 
-                // Character processing loop with all variables pre-declared
-                while (strPtr < strEnd) {
-                    // Fast UTF-8 decode with branch prediction hints
-                    if (isAsciiOnly && *strPtr > 0) [[likely]] {
-                        currCharacter = static_cast<u32>(*strPtr);
-                        ++strPtr;
-                    } else {
-                        codepointWidth = decode_utf8(&currCharacter, reinterpret_cast<const u8*>(strPtr));
-                        if (codepointWidth <= 0) [[unlikely]]
-                            break;
-                        strPtr += codepointWidth;
-                    }
-                    
-                    // Handle newlines with early continue
-                    if (currCharacter == '\n') [[unlikely]] {
-                        currX = 0;
-                        currY += fontSize;
-                        continue;
-                    }
-                    
-                    // Glyph lookup with pre-computed key
-                    key = (static_cast<u64>(currCharacter) << 32) | keyBase;
-                    it = glyphCache.find(key);
-                    
-                    if (it == glyphCache.end()) [[unlikely]] {
-                        // Create new glyph with optimized insertion
-                        insertResult = glyphCache.emplace(key, Glyph{});
-                        glyph = &insertResult.first->second;
+                // Pre-declare variables used in loops to avoid repeated allocations
+                u32 currCharacter;
+                ssize_t codepointWidth;
+                FontManager::Glyph* glyph;
+                bool symbolProcessed;
+                size_t remainingLength;
+                u32 symChar;
+                ssize_t symWidth;
+                size_t i;
+                
+                // Main processing loop with pointer arithmetic for ASCII optimization
+                if (isAsciiOnly && !specialSymbols) {
+                    // Fast ASCII-only path
+                    for (const char* p = textPtr; p < textEnd && currX < maxWidthLimit; ++p) {
+                        currCharacter = static_cast<u32>(*p);
                         
-                        // Font selection (unchanged logic but using pre-declared variables)
-                        if (stbtt_FindGlyphIndex(&this->m_extFont, currCharacter)) {
-                            glyph->currFont = &this->m_extFont;
-                        } else if (this->m_hasLocalFont && stbtt_FindGlyphIndex(&this->m_stdFont, currCharacter) == 0) {
-                            glyph->currFont = &this->m_localFont;
-                        } else {
-                            glyph->currFont = &this->m_stdFont;
+                        // Handle highlighting with configurable delimiters
+                        if (highlightingEnabled) {
+                            if (currCharacter == highlightStartChar) {
+                                inHighlight = true;
+                            } else if (currCharacter == highlightEndChar) {
+                                inHighlight = false;
+                            }
+                            currentColor = (currCharacter == highlightStartChar || currCharacter == highlightEndChar) ? 
+                                          &defaultColor : (inHighlight ? highlightColor : &defaultColor);
                         }
-            
-                        scaledFontSize = stbtt_ScaleForPixelHeight(glyph->currFont, fontSize);
-                        glyph->currFontSize = scaledFontSize;
-            
-                        stbtt_GetCodepointBitmapBoxSubpixel(glyph->currFont, currCharacter, scaledFontSize, scaledFontSize,
-                                                            0, 0, &glyph->bounds[0], &glyph->bounds[1], &glyph->bounds[2], &glyph->bounds[3]);
-            
-                        yAdvance = 0;
-                        stbtt_GetCodepointHMetrics(glyph->currFont, currCharacter, &glyph->xAdvance, &yAdvance);
-            
-                        glyph->glyphBmp = stbtt_GetCodepointBitmap(glyph->currFont, scaledFontSize, scaledFontSize, currCharacter, &glyph->width, &glyph->height, nullptr, nullptr);
-                    } else [[likely]] {
-                        glyph = &it->second;
-                    }
-                    
-                    // Pre-compute advance for cursor movement
-                    xAdvanceScaled = static_cast<s32>(glyph->xAdvance * glyph->currFontSize);
-                    
-                    // Skip whitespace rendering but advance cursor
-                    if (std::iswspace(currCharacter)) [[unlikely]] {
-                        currX += xAdvanceScaled;
-                        continue;
-                    }
-                    
-                    // Render glyph with all variables pre-declared
-                    if (glyph->glyphBmp != nullptr) [[likely]] {
-                        bounds = glyph->bounds;
-                        xPos = static_cast<s32>(currX + bounds[0]);
-                        yPos = static_cast<s32>(currY + bounds[1]);
                         
-                        // Quick reject with pre-computed framebuffer bounds
-                        if (xPos >= fbWidth || yPos >= fbHeight || xPos + glyph->width <= 0 || yPos + glyph->height <= 0) [[unlikely]] {
-                            currX += xAdvanceScaled;
+                        // Handle newline
+                        if (currCharacter == '\n') {
+                            maxX = std::max(currX, maxX);
+                            currX = x;
+                            currY += static_cast<s32>(fontSize);  // Cast to s32
                             continue;
                         }
                         
-                        bmpPtr = glyph->glyphBmp;
-                        width = glyph->width;
-                        height = glyph->height;
-                        simdWidth = width & ~3;
+                        // Get glyph (now thread-safe)
+                        glyph = FontManager::getOrCreateGlyph(currCharacter, monospace, fontSize);
+                        if (!glyph) continue;
                         
-                        // Optimized pixel rendering loop with pre-declared variables
-                        for (row = 0; row < height; ++row) {
-                            currentY = yPos + row;
-                            
-                            // Skip off-screen rows
-                            if (currentY < 0 || currentY >= fbHeight) {
-                                bmpPtr += width;
-                                continue;
-                            }
-                            
-                            // Process 4 pixels at once with pre-declared variables
-                            for (col = 0; col < simdWidth; col += 4) {
-                                x0 = xPos + col;
-                                x1 = x0 + 1;
-                                x2 = x0 + 2;
-                                x3 = x0 + 3;
-                                
-                                c0 = bmpPtr[col] >> 4;
-                                c1 = bmpPtr[col + 1] >> 4;
-                                c2 = bmpPtr[col + 2] >> 4;
-                                c3 = bmpPtr[col + 3] >> 4;
-                                
-                                // Unrolled pixel processing with bounds checking
-                                if (c0 != 0 && x0 >= 0 && x0 < fbWidth) {
-                                    if (c0 == 0xF) {
-                                        this->setPixel(x0, currentY, color, this->getPixelOffset(x0, currentY));
-                                    } else {
-                                        tmpColor = color;
-                                        tmpColor.a = c0;
-                                        this->setPixelBlendDst(x0, currentY, tmpColor);
+                        // Track maximum Y position reached (y position + glyph height)
+                        maxY = std::max(maxY, currY + static_cast<s32>(glyph->height));
+                        
+                        // Render if needed
+                        if (draw && glyph->glyphBmp && currCharacter > 32) { // Space is 32
+                            renderGlyph(glyph, currX, currY, *currentColor);
+                        }
+                        
+                        currX += static_cast<s32>(glyph->xAdvance * glyph->currFontSize);
+                    }
+                } else {
+                    // UTF-8 path with special symbols support
+                    auto itStr = text.cbegin();
+                    const auto itStrEnd = text.cend();
+                    
+                    while (itStr != itStrEnd && currX < maxWidthLimit) {
+                        // Check for special symbols first
+                        symbolProcessed = false;
+                        if (specialSymbols) {
+                            remainingLength = itStrEnd - itStr;
+                            for (const auto& symbol : *specialSymbols) {
+                                if (remainingLength >= symbol.length() &&
+                                    std::equal(symbol.begin(), symbol.end(), itStr)) {
+                                    
+                                    // Process special symbol
+                                    for (i = 0; i < symbol.length(); ) {
+                                        symWidth = decode_utf8(&symChar, 
+                                            reinterpret_cast<const u8*>(&symbol[i]));
+                                        if (symWidth <= 0) break;
+                                        
+                                        if (symChar == '\n') {
+                                            maxX = std::max(currX, maxX);
+                                            currX = x;
+                                            currY += static_cast<s32>(fontSize);
+                                        } else {
+                                            glyph = FontManager::getOrCreateGlyph(symChar, monospace, fontSize);
+                                            if (glyph) {
+                                                // Track maximum Y position reached
+                                                maxY = std::max(maxY, currY + static_cast<s32>(glyph->height));
+                                                
+                                                if (draw && glyph->glyphBmp && symChar > 32) {
+                                                    renderGlyph(glyph, currX, currY, *highlightColor);
+                                                }
+                                                currX += static_cast<s32>(glyph->xAdvance * glyph->currFontSize);
+                                            }
+                                        }
+                                        i += symWidth;
                                     }
-                                }
-                                
-                                if (c1 != 0 && x1 >= 0 && x1 < fbWidth) {
-                                    if (c1 == 0xF) {
-                                        this->setPixel(x1, currentY, color, this->getPixelOffset(x1, currentY));
-                                    } else {
-                                        tmpColor = color;
-                                        tmpColor.a = c1;
-                                        this->setPixelBlendDst(x1, currentY, tmpColor);
-                                    }
-                                }
-                                
-                                if (c2 != 0 && x2 >= 0 && x2 < fbWidth) {
-                                    if (c2 == 0xF) {
-                                        this->setPixel(x2, currentY, color, this->getPixelOffset(x2, currentY));
-                                    } else {
-                                        tmpColor = color;
-                                        tmpColor.a = c2;
-                                        this->setPixelBlendDst(x2, currentY, tmpColor);
-                                    }
-                                }
-                                
-                                if (c3 != 0 && x3 >= 0 && x3 < fbWidth) {
-                                    if (c3 == 0xF) {
-                                        this->setPixel(x3, currentY, color, this->getPixelOffset(x3, currentY));
-                                    } else {
-                                        tmpColor = color;
-                                        tmpColor.a = c3;
-                                        this->setPixelBlendDst(x3, currentY, tmpColor);
-                                    }
+                                    itStr += symbol.length();
+                                    symbolProcessed = true;
+                                    break;
                                 }
                             }
-                            
-                            // Handle remaining pixels with pre-declared variables
-                            for (; col < width; ++col) {
-                                currentX = xPos + col;
-                                if (currentX >= 0 && currentX < fbWidth) {
-                                    bmpColor = bmpPtr[col] >> 4;
-                                    if (bmpColor == 0xF) {
-                                        this->setPixel(currentX, currentY, color, this->getPixelOffset(currentX, currentY));
-                                    } else if (bmpColor != 0x0) {
-                                        tmpColor = color;
-                                        tmpColor.a = bmpColor;
-                                        this->setPixelBlendDst(currentX, currentY, tmpColor);
-                                    }
-                                }
+                        }
+                        
+                        if (symbolProcessed) continue;
+                        
+                        // Decode character
+                        if (isAsciiOnly) {
+                            currCharacter = static_cast<u32>(*itStr);
+                            codepointWidth = 1;
+                        } else {
+                            codepointWidth = decode_utf8(&currCharacter, reinterpret_cast<const u8*>(&(*itStr)));
+                            if (codepointWidth <= 0) break;
+                        }
+                        
+                        itStr += codepointWidth;
+                        
+                        // Handle highlighting with configurable delimiters
+                        if (highlightingEnabled) {
+                            if (currCharacter == highlightStartChar) {
+                                inHighlight = true;
+                            } else if (currCharacter == highlightEndChar) {
+                                inHighlight = false;
                             }
-                            
-                            bmpPtr += width;
+                            currentColor = (currCharacter == highlightStartChar || currCharacter == highlightEndChar) ? 
+                                          &defaultColor : (inHighlight ? highlightColor : &defaultColor);
+                        }
+                        
+                        // Handle newline
+                        if (currCharacter == '\n') {
+                            maxX = std::max(currX, maxX);
+                            currX = x;
+                            currY += static_cast<s32>(fontSize);
+                            continue;
+                        }
+                        
+                        // Get glyph (now thread-safe)
+                        glyph = FontManager::getOrCreateGlyph(currCharacter, monospace, fontSize);
+                        if (!glyph) continue;
+                        
+                        // Track maximum Y position reached
+                        maxY = std::max(maxY, currY + static_cast<s32>(glyph->height));
+                        
+                        // Render if needed
+                        if (draw && glyph->glyphBmp && currCharacter > 32) {
+                            renderGlyph(glyph, currX, currY, *currentColor);
+                        }
+                        
+                        currX += static_cast<s32>(glyph->xAdvance * glyph->currFontSize);
+                    }
+                }
+                
+                maxX = std::max(currX, maxX);
+                // Use same pattern as width: maxY - y (maximum Y position reached - starting Y)
+                return {maxX - x, maxY - y};
+            }
+            
+            // Convenience wrappers for backward compatibility
+            inline std::pair<s32, s32> drawStringWithHighlight(const std::string& text, bool monospace, 
+                                                              s32 x, s32 y, const u32 fontSize, 
+                                                              const Color& defaultColor, 
+                                                              const Color& specialColor, 
+                                                              const ssize_t maxWidth = 0,
+                                                              const u32 startChar = '(',
+                                                              const u32 endChar = ')') {
+                return drawString(text, monospace, x, y, fontSize, defaultColor, maxWidth, true, &specialColor, nullptr, startChar, endChar);
+            }
+            
+            inline std::pair<s32, s32> drawStringWithColoredSections(const std::string& text, bool monospace,
+                                                    const std::vector<std::string>& specialSymbols, 
+                                                    s32 x, const s32 y, const u32 fontSize, 
+                                                    const Color& defaultColor, 
+                                                    const Color& specialColor) {
+                return drawString(text, monospace, x, y, fontSize, defaultColor, 0, true, &specialColor, &specialSymbols);
+            }
+            
+            // Calculate string dimensions without drawing
+            inline std::pair<s32, s32> getTextDimensions(const std::string& text, bool monospace, 
+                                                         const u32 fontSize, const ssize_t maxWidth = 0) {
+                return drawString(text, monospace, 0, 0, fontSize, Color{0,0,0,0}, maxWidth, false);
+            }
+            
+            // Thread-safe limitStringLength using the unified cache
+            inline std::string limitStringLength(const std::string& originalString, const bool monospace, 
+                                               const u32 fontSize, const s32 maxLength) {  // Changed fontSize to u32
+                
+                // Thread-safe translation cache access
+                std::string text;
+                #ifdef UI_OVERRIDE_PATH
+                {
+                    std::shared_lock<std::shared_mutex> readLock(s_translationCacheMutex);
+                    auto translatedIt = ult::translationCache.find(originalString);
+                    if (translatedIt != ult::translationCache.end()) {
+                        text = translatedIt->second;
+                    } else {
+                        // Need to upgrade to write lock
+                        readLock.unlock();
+                        std::unique_lock<std::shared_mutex> writeLock(s_translationCacheMutex);
+                        
+                        // Double-check pattern
+                        translatedIt = ult::translationCache.find(originalString);
+                        if (translatedIt != ult::translationCache.end()) {
+                            text = translatedIt->second;
+                        } else {
+                            ult::translationCache[originalString] = originalString;
+                            text = originalString;
                         }
                     }
-                    
-                    currX += xAdvanceScaled;
                 }
-            }
-
-                                    
-            /**
-             * @brief Limit a string's length and end it with "…" - Actually optimized version
-             *
-             * @param string String to truncate
-             * @param monospace Whether the font is monospace
-             * @param fontSize Size of the font
-             * @param maxLength Maximum length of the string in terms of width
-             */
-            inline std::string limitStringLength(const std::string& originalString, const bool monospace, const s32 fontSize, const s32 maxLength) {
-                #ifdef UI_OVERRIDE_PATH
-                // Check for translation in the cache
-                auto translatedIt = ult::translationCache.find(originalString);
-                std::string translatedString = (translatedIt != ult::translationCache.end()) ? translatedIt->second : originalString;
-                
-                // Cache the translation if it wasn't already present
-                if (translatedIt == ult::translationCache.end()) {
-                    ult::translationCache[originalString] = translatedString;
-                }
-                const std::string* stringPtr = &translatedString;
                 #else
-                const std::string* stringPtr = &originalString;
+                text = originalString;
                 #endif
                 
-                if (stringPtr->size() < 2) {
-                    return *stringPtr;
-                }
+                if (text.size() < 2) return text;
                 
-                // Pre-calculate ellipsis width once
-                constexpr u32 ellipsisCharacter = 0x2026;  // Unicode code point for '…'
-                stbtt_fontinfo* ellipsisFont = &this->m_stdFont;
-                if (stbtt_FindGlyphIndex(&this->m_extFont, ellipsisCharacter)) {
-                    ellipsisFont = &this->m_extFont;
-                } else if (this->m_hasLocalFont && stbtt_FindGlyphIndex(&this->m_stdFont, ellipsisCharacter) == 0) {
-                    ellipsisFont = &this->m_localFont;
-                }
+                // Get ellipsis width using shared cache (now thread-safe)
+                constexpr u32 ellipsisChar = 0x2026;
+                FontManager::Glyph* ellipsisGlyph = FontManager::getOrCreateGlyph(ellipsisChar, monospace, fontSize);
+                if (!ellipsisGlyph) return text;
                 
-                const float ellipsisFontSize = stbtt_ScaleForPixelHeight(ellipsisFont, fontSize);
-                int ellipsisXAdvance = 0;
-                stbtt_GetCodepointHMetrics(ellipsisFont, ellipsisCharacter, &ellipsisXAdvance, nullptr);
-                const s32 ellipsisWidth = static_cast<s32>(ellipsisXAdvance * ellipsisFontSize);
-                
-                // THE KEY OPTIMIZATION: Incremental width calculation instead of recalculating entire substring
-                s32 currX = 0;
+                // Fixed: Use consistent s32 calculation like other functions
+                const s32 ellipsisWidth = static_cast<s32>(ellipsisGlyph->xAdvance * ellipsisGlyph->currFontSize);
                 const s32 maxWidthWithoutEllipsis = maxLength - ellipsisWidth;
-                const char* strPtr = stringPtr->data();
-                const char* const strEnd = strPtr + stringPtr->size();
-                const char* lastValidPos = strPtr;
                 
-                // MOVED OUTSIDE LOOP: Pre-declare variables used in loop
-                u32 currCharacter;
-                ssize_t codepointWidth;
-                stbtt_fontinfo* font;
-                float fontScale;
-                int xAdvance;
-                s32 charWidth;
-                
-                // Pre-calculate monospace character width if needed
-                s32 monospaceCharWidth = 0;
-                if (monospace) {
-                    stbtt_fontinfo* monoFont = &this->m_stdFont;
-                    if (stbtt_FindGlyphIndex(&this->m_extFont, 'W')) {
-                        monoFont = &this->m_extFont;
-                    } else if (this->m_hasLocalFont && stbtt_FindGlyphIndex(&this->m_stdFont, 'W') == 0) {
-                        monoFont = &this->m_localFont;
-                    }
-                    //const float monoFontScale = stbtt_ScaleForPixelHeight(monoFont, fontSize);
-                    int monoXAdvance = 0;
-                    stbtt_GetCodepointHMetrics(monoFont, 'W', &monoXAdvance, nullptr);
-                    monospaceCharWidth = static_cast<s32>(monoXAdvance * stbtt_ScaleForPixelHeight(monoFont, fontSize));
+                if (maxWidthWithoutEllipsis <= 0) {
+                    return "…"; // If there's no room for text, just return ellipsis
                 }
                 
-                while (strPtr < strEnd) {
-                    codepointWidth = decode_utf8(&currCharacter, reinterpret_cast<const u8*>(strPtr));
-                    if (codepointWidth <= 0) break;
+                // Calculate width incrementally
+                s32 currX = 0;
+                auto itStr = text.cbegin();
+                const auto itStrEnd = text.cend();
+                auto lastValidPos = itStr;
+                
+                // Fast ASCII check
+                bool isAsciiOnly = true;
+                for (unsigned char c : text) {
+                    if (c > 127) {
+                        isAsciiOnly = false;
+                        break;
+                    }
+                }
+                
+                while (itStr != itStrEnd) {
+                    u32 currCharacter;
+                    ssize_t codepointWidth;
                     
-                    if (monospace) {
-                        // Use pre-calculated monospace width
-                        charWidth = monospaceCharWidth;
+                    // Decode UTF-8 codepoint
+                    if (isAsciiOnly) {
+                        currCharacter = static_cast<u32>(*itStr);
+                        codepointWidth = 1;
                     } else {
-                        // Calculate width of just this character
-                        font = &this->m_stdFont;
-                        if (stbtt_FindGlyphIndex(&this->m_extFont, currCharacter)) {
-                            font = &this->m_extFont;
-                        } else if (this->m_hasLocalFont && stbtt_FindGlyphIndex(&this->m_stdFont, currCharacter) == 0) {
-                            font = &this->m_localFont;
-                        }
-                        
-                        fontScale = stbtt_ScaleForPixelHeight(font, fontSize);
-                        xAdvance = 0;
-                        stbtt_GetCodepointHMetrics(font, currCharacter, &xAdvance, nullptr);
-                        charWidth = static_cast<s32>(xAdvance * fontScale);
+                        codepointWidth = decode_utf8(&currCharacter, reinterpret_cast<const u8*>(&(*itStr)));
+                        if (codepointWidth <= 0) break;
                     }
                     
-                    // Check if adding this character would exceed the limit
+                    // FontManager::getOrCreateGlyph is now thread-safe
+                    FontManager::Glyph* glyph = FontManager::getOrCreateGlyph(currCharacter, monospace, fontSize);
+                    if (!glyph) {
+                        itStr += codepointWidth;
+                        continue;
+                    }
+                    
+                    // Fixed: Use consistent s32 calculation
+                    s32 charWidth = static_cast<s32>(glyph->xAdvance * glyph->currFontSize);
+                    
                     if (currX + charWidth > maxWidthWithoutEllipsis) {
-                        // Return truncated string with ellipsis
-                        //const size_t truncateLength = lastValidPos - stringPtr->data();
-                        return stringPtr->substr(0, lastValidPos - stringPtr->data()) + "…";
+                        // Calculate the byte position for substring
+                        size_t bytePos = std::distance(text.cbegin(), lastValidPos);
+                        return text.substr(0, bytePos) + "…";
                     }
                     
-                    // Add this character's width and continue
                     currX += charWidth;
-                    strPtr += codepointWidth;
-                    lastValidPos = strPtr;
+                    itStr += codepointWidth;
+                    lastValidPos = itStr;
                 }
                 
-                // String fits entirely
-                return *stringPtr;
+                return text;
             }
 
             inline void setLayerPos(u32 x, u32 y) {
@@ -3351,15 +2699,15 @@ namespace tsl {
                 static time_t lastTimeUpdate = 0;
                 static char timeStr[20]; // Allocate a buffer to store the time string
                 size_t y_offset = 45;
-        
+            
                 if (!(ult::hideBattery && ult::hidePCBTemp && ult::hideSOCTemp && ult::hideClock)) {
                     drawRect(245, 23, 1, 49, a(separatorColor));
                 }
-
+            
                 if ((ult::hideBattery && ult::hidePCBTemp && ult::hideSOCTemp) || ult::hideClock) {
                     y_offset += 10;
                 }
-
+            
                 // Use simpler time() function instead of clock_gettime for seconds precision
                 time_t currentTime = time(nullptr);
                 if (!ult::hideClock) {
@@ -3369,15 +2717,16 @@ namespace tsl {
                         ult::localizeTimeStr(timeStr);
                         lastTimeUpdate = currentTime;
                     }
-                    drawString(timeStr, false, tsl::cfg::FramebufferWidth - calculateStringWidth(timeStr, 20, true) - 20, y_offset, 20, a(clockColor));
+                    auto [timeWidth, timeHeight] = getTextDimensions(timeStr, false, 20);
+                    drawString(timeStr, false, tsl::cfg::FramebufferWidth - timeWidth - 20, y_offset, 20, a(clockColor));
                     y_offset += 22;
                 }
-        
+            
                 // Draw temperatures and battery percentage
                 static char PCB_temperatureStr[10];
                 static char SOC_temperatureStr[10];
                 static char chargeString[6];
-        
+            
                 size_t statusChange = size_t(ult::hideSOCTemp) + size_t(ult::hidePCBTemp) + size_t(ult::hideBattery);
                 static size_t lastStatusChange = 0;
                 static time_t lastSensorUpdate = 0;
@@ -3388,7 +2737,7 @@ namespace tsl {
                         ult::ReadSocTemperature(&ult::SOC_temperature);
                         snprintf(SOC_temperatureStr, sizeof(SOC_temperatureStr) - 1, "%d°C", static_cast<int>(round(ult::SOC_temperature)));
                     } else {
-                        strcpy(SOC_temperatureStr, "");
+                        __builtin_strcpy(SOC_temperatureStr, "");
                         ult::SOC_temperature = 0;
                     }
                     
@@ -3396,7 +2745,7 @@ namespace tsl {
                         ult::ReadPcbTemperature(&ult::PCB_temperature);
                         snprintf(PCB_temperatureStr, sizeof(PCB_temperatureStr) - 1, "%d°C", static_cast<int>(round(ult::PCB_temperature)));
                     } else {
-                        strcpy(PCB_temperatureStr, "");
+                        __builtin_strcpy(PCB_temperatureStr, "");
                         ult::PCB_temperature = 0;
                     }
                     
@@ -3405,7 +2754,7 @@ namespace tsl {
                         ult::batteryCharge = std::min(ult::batteryCharge, 100U);
                         sprintf(chargeString, "%d%%", ult::batteryCharge);
                     } else {
-                        strcpy(chargeString, "");
+                        __builtin_strcpy(chargeString, "");
                         ult::batteryCharge = 0;
                     }
                     
@@ -3413,28 +2762,106 @@ namespace tsl {
                     lastStatusChange = statusChange;
                 }
                 
+                // Calculate string widths only when needed
+                s32 chargeWidth = 0, pcbWidth = 0, socWidth = 0;
+                
                 // Draw battery percentage
                 if (!ult::hideBattery && ult::batteryCharge > 0) {
                     Color batteryColorToUse = ult::isCharging ? tsl::Color(0x0, 0xF, 0x0, 0xF) : 
                                             (ult::batteryCharge < 20 ? tsl::Color(0xF, 0x0, 0x0, 0xF) : batteryColor);
-                    drawString(chargeString, false, tsl::cfg::FramebufferWidth - calculateStringWidth(chargeString, 20, true) - 20, y_offset, 20, a(batteryColorToUse));
+                    auto [width, height] = getTextDimensions(chargeString, false, 20);
+                    chargeWidth = width;
+                    drawString(chargeString, false, tsl::cfg::FramebufferWidth - chargeWidth - 20, y_offset, 20, a(batteryColorToUse));
                 }
-        
+            
                 // Draw PCB and SOC temperatures
                 int offset = 0;
                 if (!ult::hidePCBTemp && ult::PCB_temperature > 0) {
                     if (!ult::hideBattery)
                         offset -= 5;
-                    drawString(PCB_temperatureStr, false, tsl::cfg::FramebufferWidth + offset - calculateStringWidth(PCB_temperatureStr, 20, true) - calculateStringWidth(chargeString, 20, true) - 22, y_offset, 20, a(tsl::GradientColor(ult::PCB_temperature)));
+                    auto [width, height] = getTextDimensions(PCB_temperatureStr, false, 20);
+                    pcbWidth = width;
+                    drawString(PCB_temperatureStr, false, tsl::cfg::FramebufferWidth + offset - pcbWidth - chargeWidth - 22, y_offset, 20, a(tsl::GradientColor(ult::PCB_temperature)));
                 }
-        
+            
                 if (!ult::hideSOCTemp && ult::SOC_temperature > 0) {
                     if (!ult::hidePCBTemp || !ult::hideBattery)
                         offset -= 5;
-                    drawString(SOC_temperatureStr, false, tsl::cfg::FramebufferWidth + offset - calculateStringWidth(SOC_temperatureStr, 20, true) - calculateStringWidth(PCB_temperatureStr, 20, true) - calculateStringWidth(chargeString, 20, true) - 22, y_offset, 20, a(tsl::GradientColor(ult::SOC_temperature)));
+                    auto [width, height] = getTextDimensions(SOC_temperatureStr, false, 20);
+                    socWidth = width;
+                    drawString(SOC_temperatureStr, false, tsl::cfg::FramebufferWidth + offset - socWidth - pcbWidth - chargeWidth - 22, y_offset, 20, a(tsl::GradientColor(ult::SOC_temperature)));
                 }
             }
             #endif
+
+            // Single unified glyph cache for all text operations
+            //inline static std::unordered_map<u64, Glyph> s_unifiedGlyphCache;
+            
+            // Helper to select appropriate font for a character
+            inline FontManager::Glyph* getOrCreateGlyph(u32 character, bool monospace, u32 fontSize) {
+                return FontManager::getOrCreateGlyph(character, monospace, fontSize);
+            }
+            
+            inline stbtt_fontinfo* selectFontForCharacter(u32 character) {
+                return FontManager::selectFontForCharacter(character);
+            }
+            
+            // Optimized glyph rendering
+            inline void renderGlyph(const FontManager::Glyph* glyph, float x, float y, const Color& color) {
+                if (!glyph->glyphBmp || color.a == 0) return;
+                
+                const s32 xPos = static_cast<s32>(x + glyph->bounds[0]);
+                const s32 yPos = static_cast<s32>(y + glyph->bounds[1]);
+                
+                // Quick bounds check
+                if (xPos >= cfg::FramebufferWidth || yPos >= cfg::FramebufferHeight ||
+                    xPos + glyph->width <= 0 || yPos + glyph->height <= 0) return;
+                
+                // Calculate clipping
+                const s32 startX = std::max(0, -xPos);
+                const s32 startY = std::max(0, -yPos);
+                const s32 endX = std::min(glyph->width, static_cast<s32>(cfg::FramebufferWidth) - xPos);
+                const s32 endY = std::min(glyph->height, static_cast<s32>(cfg::FramebufferHeight) - yPos);
+                
+                // Render with optimized inner loop
+                const uint8_t* bmpPtr = glyph->glyphBmp + startY * glyph->width;
+                for (s32 bmpY = startY; bmpY < endY; ++bmpY) {
+                    const s32 pixelY = yPos + bmpY;
+                    s32 bmpX = startX;
+                    
+                    // Process 8 pixels at once
+                    const s32 simdEnd = std::min(endX, (startX + 7) & ~7);
+                    for (; bmpX < simdEnd; ++bmpX) {
+                        const uint8_t alpha = bmpPtr[bmpX] >> 4;
+                        if (alpha) {
+                            const s32 pixelX = xPos + bmpX;
+                            if (alpha == 0xF) {
+                                this->setPixel(pixelX, pixelY, color, this->getPixelOffset(pixelX, pixelY));
+                            } else {
+                                Color tmpColor = color;
+                                tmpColor.a = alpha;
+                                this->setPixelBlendDst(pixelX, pixelY, tmpColor);
+                            }
+                        }
+                    }
+                    
+                    // Process remaining pixels
+                    for (; bmpX < endX; ++bmpX) {
+                        const uint8_t alpha = bmpPtr[bmpX] >> 4;
+                        if (alpha) {
+                            const s32 pixelX = xPos + bmpX;
+                            if (alpha == 0xF) {
+                                this->setPixel(pixelX, pixelY, color, this->getPixelOffset(pixelX, pixelY));
+                            } else {
+                                Color tmpColor = color;
+                                tmpColor.a = alpha;
+                                this->setPixelBlendDst(pixelX, pixelY, tmpColor);
+                            }
+                        }
+                    }
+                    bmpPtr += glyph->width;
+                }
+            }
 
             
         private:
@@ -3464,10 +2891,12 @@ namespace tsl {
             
             std::stack<ScissoringConfig> m_scissoringStack;
             
-            
+            #ifdef UI_OVERRIDE_PATH
+            static std::shared_mutex s_translationCacheMutex;
+            #endif
+
             static inline float s_opacity = 1.0F;
             
-            //u32 tmpPos;
             
             /**
              * @brief Get the current framebuffer address
@@ -3685,6 +3114,9 @@ namespace tsl {
                 if (!this->m_initialized)
                     return;
                 
+                // Cleanup shared font manager
+                FontManager::cleanup();
+
                 framebufferClose(&this->m_framebuffer);
                 nwindowClose(&this->m_window);
                 viDestroyManagedLayer(&this->m_layer);
@@ -3741,6 +3173,10 @@ namespace tsl {
                 
                 fontBuffer = reinterpret_cast<u8*>(extFontData.address);
                 stbtt_InitFont(&this->m_extFont, fontBuffer, stbtt_GetFontOffsetForIndex(fontBuffer, 0));
+                
+                // Initialize the shared font manager
+                FontManager::initializeFonts(&this->m_stdFont, &this->m_localFont, 
+                                           &this->m_extFont, this->m_hasLocalFont);
                 
                 return 0;
             }
@@ -3810,13 +3246,14 @@ namespace tsl {
                 const float colorAFloat = float(color.a) / 15.0f;  // Divide by 15, not 0xF
                 const u8* bmpPtr = glyphBmp;  // Cache pointer for faster access
                 
+                Color tmpColor = {0};
                 // Single loop with pointer arithmetic
                 for (s32 bmpY = 0; bmpY < height; bmpY++) {
                     const s32 pixelY = y + bmpY;
                     for (s32 bmpX = 0; bmpX < width; bmpX++) {
                         const u8 alpha = *bmpPtr++;  // Direct pointer increment
                         if (alpha) {  // Skip transparent pixels
-                            Color tmpColor = color;
+                            tmpColor = color;
                             tmpColor.a = (alpha >> 4) * colorAFloat;
                             this->setPixelBlendSrc(x + bmpX, pixelY, tmpColor);
                         }
@@ -3862,82 +3299,6 @@ namespace tsl {
             return {horizontalUnderscanPixels, verticalUnderscanPixels};
         }
 
-
-        // Helper function to calculate string width
-        static float calculateStringWidth(const std::string& originalString, const float fontSize, const bool fixedWidthNumbers = false) {
-            if (originalString.empty()) {
-                return 0.0f;
-            }
-        
-            static const stbtt_fontinfo& font = tsl::gfx::Renderer::get().getStandardFont();
-            float maxWidth = 0.0f;
-            float currentLineWidth = 0.0f;
-            ssize_t codepointWidth;
-            u32 prevCharacter = 0;
-            u32 currCharacter = 0;
-        
-            static std::unordered_map<u64, Renderer::Glyph> s_glyphCache;
-            auto itStrEnd = originalString.cend();
-            auto itStr = originalString.cbegin();
-        
-            u64 key = 0;
-            Renderer::Glyph* glyph = nullptr;
-            auto it = s_glyphCache.end();
-        
-            while (itStr != itStrEnd) {
-                // Decode UTF-8 codepoint
-                codepointWidth = decode_utf8(&currCharacter, reinterpret_cast<const u8*>(&(*itStr)));
-                if (codepointWidth <= 0) {
-                    break;
-                }
-        
-                // Move the iterator forward by the width of the current codepoint
-                itStr += codepointWidth;
-        
-                // If newline, finalize the current line's width and start a new line
-                if (currCharacter == '\n') {
-                    if (currentLineWidth > maxWidth) {
-                        maxWidth = currentLineWidth;
-                    }
-                    currentLineWidth = 0.0f; // Reset for the new line
-                    prevCharacter = 0;
-                    continue;
-                }
-        
-                // Calculate glyph key
-                key = (static_cast<u64>(currCharacter) << 32) | (static_cast<u64>(fixedWidthNumbers) << 31) | (static_cast<u64>(std::bit_cast<u32>(fontSize)));
-        
-                // Check cache for the glyph
-                it = s_glyphCache.find(key);
-        
-                // If glyph not found, create and cache it
-                if (it == s_glyphCache.end()) {
-                    glyph = &s_glyphCache.emplace(key, Renderer::Glyph()).first->second;
-        
-                    // Use const_cast to handle const font
-                    glyph->currFont = const_cast<stbtt_fontinfo*>(&font);
-                    glyph->currFontSize = stbtt_ScaleForPixelHeight(glyph->currFont, fontSize);
-                    stbtt_GetCodepointHMetrics(glyph->currFont, currCharacter, &glyph->xAdvance, nullptr);
-                } else {
-                    glyph = &it->second;
-                }
-        
-                if (prevCharacter) {
-                    float kernAdvance = stbtt_GetCodepointKernAdvance(glyph->currFont, prevCharacter, currCharacter);
-                    currentLineWidth += kernAdvance * glyph->currFontSize;
-                }
-        
-                currentLineWidth += int(glyph->xAdvance * glyph->currFontSize);
-                prevCharacter = currCharacter;
-            }
-        
-            // Final comparison for the last line (if no trailing newline)
-            if (currentLineWidth > maxWidth) {
-                maxWidth = currentLineWidth;
-            }
-        
-            return maxWidth;
-        }
     }
     
     
@@ -4126,36 +3487,40 @@ namespace tsl {
                     return;
                 if (!disableSelectionBG)
                     renderer->drawRect(this->getX() + x + 4, this->getY() + y, this->getWidth() - 8, this->getHeight(), a(selectionBGColor)); // CUSTOM MODIFICATION 
-
+            
                 saturation = tsl::style::ListItemHighlightSaturation * (float(this->m_clickAnimationProgress) / float(tsl::style::ListItemHighlightLength));
-
+            
                 Color animColor = {0xF,0xF,0xF,0xF};
                 if (invertBGClickColor) {
-                    animColor.r = 15-saturation;
-                    animColor.g = 15-saturation;
-                    animColor.b = 15-saturation;
-                    animColor.a = 15-saturation;
+                    u8 inverted = 15-saturation;
+                    animColor = {inverted, inverted, inverted, inverted};
                 } else {
-                    animColor.r = saturation;
-                    animColor.g = saturation;
-                    animColor.b = saturation;
-                    animColor.a = saturation;
+                    animColor = {saturation, saturation, saturation, saturation};
                 }
                 renderer->drawRect(ELEMENT_BOUNDS(this), a(animColor));
-
+            
+                // Cache time calculation - only compute once
+                static u64 lastTimeUpdate = 0;
+                static double cachedProgress = 0.0;
+                u64 currentTime_ns = armTicksToNs(armGetSystemTick());
+                
+                // Only recalculate progress if enough time has passed (reduce computation frequency)
+                if (currentTime_ns - lastTimeUpdate > 16666666) { // ~60 FPS update rate
+                    double time_seconds = currentTime_ns / 1000000000.0;
+                    cachedProgress = (std::cos(2.0 * ult::_M_PI * std::fmod(time_seconds - 0.25, 1.0)) + 1.0) / 2.0;
+                    lastTimeUpdate = currentTime_ns;
+                }
+                progress = cachedProgress;
+                
                 Color clickColor1 = highlightColor1;
                 Color clickColor2 = clickColor;
-                
-                // Changed timing calculation to use armTicksToNs
-                u64 currentTime_ns = armTicksToNs(armGetSystemTick());
-                double time_seconds = currentTime_ns / 1000000000.0; // Convert nanoseconds to seconds
-                progress = (std::cos(2.0 * ult::_M_PI * std::fmod(time_seconds - 0.25, 1.0)) + 1.0) / 2.0;
                 
                 if (progress >= 0.5) {
                     clickColor1 = clickColor;
                     clickColor2 = highlightColor2;
                 }
                 
+                // Combine color interpolation into single calculation
                 highlightColor = {
                     static_cast<u8>((clickColor1.r - clickColor2.r) * progress + clickColor2.r),
                     static_cast<u8>((clickColor1.g - clickColor2.g) * progress + clickColor2.g),
@@ -4166,45 +3531,31 @@ namespace tsl {
                 x = 0;
                 y = 0;
                 if (this->m_highlightShaking) {
-                    u64 currentTime_ns = armTicksToNs(armGetSystemTick());
-                    t_ns = currentTime_ns - this->m_highlightShakingStartTime; // Changed
+                    t_ns = currentTime_ns - this->m_highlightShakingStartTime;
                     if (t_ns >= 100000000) // 100ms in nanoseconds
                         this->m_highlightShaking = false;
                     else {
-                        amplitude = std::rand() % 5 + 5;
+                        // Use faster random generation if available, or cache amplitude
+                        static int cachedAmplitude = std::rand() % 5 + 5;
+                        if (t_ns % 10000000 == 0) // Update amplitude less frequently
+                            cachedAmplitude = std::rand() % 5 + 5;
+                        amplitude = cachedAmplitude;
                         
-                    switch (this->m_highlightShakingDirection) {
-                        case FocusDirection::Up:
-                            y -= shakeAnimation(t_ns, amplitude); // Changed parameter
-                            break;
-                        case FocusDirection::Down:
-                            y += shakeAnimation(t_ns, amplitude); // Changed parameter
-                            break;
-                        case FocusDirection::Left:
-                            x -= shakeAnimation(t_ns, amplitude); // Changed parameter
-                            break;
-                        case FocusDirection::Right:
-                            x += shakeAnimation(t_ns, amplitude); // Changed parameter
-                            break;
-                        default:
-                            break;
-                    }
+                        int shakeOffset = shakeAnimation(t_ns, amplitude);
+                        switch (this->m_highlightShakingDirection) {
+                            case FocusDirection::Up:    y = -shakeOffset; break;
+                            case FocusDirection::Down:  y = shakeOffset; break;
+                            case FocusDirection::Left:  x = -shakeOffset; break;
+                            case FocusDirection::Right: x = shakeOffset; break;
+                            default: break;
+                        }
                         
                         x = std::clamp(x, -amplitude, amplitude);
                         y = std::clamp(y, -amplitude, amplitude);
                     }
                 }
                 
-                
-                //renderer->drawRect(this->getX() + x - 4, this->getY() + y - 4, this->getWidth() + 8, 4, highlightColor);
-                //renderer->drawRect(this->getX() + x - 4, this->getY() + y + this->getHeight(), this->getWidth() + 8, 4, highlightColor);
-                //renderer->drawRect(this->getX() + x - 4, this->getY() + y, 4, this->getHeight(), highlightColor);
-                //renderer->drawRect(this->getX() + x + this->getWidth(), this->getY() + y, 4, this->getHeight(), highlightColor);
-                
-                
                 renderer->drawBorderedRoundedRect(this->getX() + x, this->getY() + y, this->getWidth() +4, this->getHeight(), 5, 5, a(highlightColor));
-                    
-                //}
             }
             
             /**
@@ -4214,21 +3565,16 @@ namespace tsl {
              * @param renderer Renderer
              */
             virtual void drawFocusBackground(gfx::Renderer *renderer) {
-                //if (!disableSelectionBG)
-                //    renderer->drawRect(ELEMENT_BOUNDS(this), a(selectionBGColor)); // CUSTOM MODIFICATION 
-                
                 if (this->m_clickAnimationProgress > 0) {
                     this->drawClickAnimation(renderer);
-        
-                    // Calculate time elapsed since the animation started using armTicksToNs
-                    u64 currentTime_ns = armTicksToNs(armGetSystemTick());
-                    u64 elapsed_ns = currentTime_ns - this->m_animationStartTime;
-                    double elapsed_ms = elapsed_ns / 1000000.0; // Convert to milliseconds
-        
-                    // Decrease progress based on the elapsed time (1 second = 1000ms)
-                    this->m_clickAnimationProgress = tsl::style::ListItemHighlightLength * (1.0f - (elapsed_ms / 500.0f));
-        
-                    // Ensure progress does not go below 0
+            
+                    // Single time calculation and direct millisecond conversion
+                    double elapsed_ms = (armTicksToNs(armGetSystemTick()) - this->m_animationStartTime) * 0.000001; // Direct conversion
+            
+                    // Direct calculation without intermediate multiplication
+                    this->m_clickAnimationProgress = tsl::style::ListItemHighlightLength * (1.0f - elapsed_ms * 0.002f); // 0.002f = 1/500
+            
+                    // Clamp to 0 in one operation
                     if (this->m_clickAnimationProgress < 0) {
                         this->m_clickAnimationProgress = 0;
                     }
@@ -4245,13 +3591,28 @@ namespace tsl {
                 if (!m_isItem)
                     return;
                 
-                
-                // Changed timing calculation to use armTicksToNs
+                // Use cached time calculation from drawClickAnimation if possible
+                static u64 lastHighlightUpdate = 0;
+                static double cachedHighlightProgress = 0.0;
                 u64 currentTime_ns = armTicksToNs(armGetSystemTick());
-                double time_seconds = currentTime_ns / 1000000000.0; // Convert nanoseconds to seconds
-                progress = ((std::cos(2.0 * ult::_M_PI * std::fmod(time_seconds - 0.25, 1.0)) + 1.0) / 2.0);
-
-                if (ult::runningInterpreter.load(std::memory_order_acquire)) {
+                
+                // Update progress at 60 FPS rate
+                if (currentTime_ns - lastHighlightUpdate > 16666666) {
+                    double time_seconds = currentTime_ns * 0.000000001; // Direct conversion
+                    cachedHighlightProgress = (std::cos(2.0 * ult::_M_PI * std::fmod(time_seconds - 0.25, 1.0)) + 1.0) * 0.5;
+                    lastHighlightUpdate = currentTime_ns;
+                }
+                progress = cachedHighlightProgress;
+            
+                // Cache the interpreter state check result to avoid atomic load overhead
+                static bool lastInterpreterState = false;
+                static u64 lastInterpreterCheck = 0;
+                if (currentTime_ns - lastInterpreterCheck > 50000000) { // Check every 50ms
+                    lastInterpreterState = ult::runningInterpreter.load(std::memory_order_acquire);
+                    lastInterpreterCheck = currentTime_ns;
+                }
+            
+                if (lastInterpreterState) {
                     highlightColor = {
                         static_cast<u8>((highlightColor3.r - highlightColor4.r) * progress + highlightColor4.r),
                         static_cast<u8>((highlightColor3.g - highlightColor4.g) * progress + highlightColor4.g),
@@ -4266,43 +3627,39 @@ namespace tsl {
                         0xF
                     };
                 }
+                
                 x = 0;
                 y = 0;
                 
                 if (this->m_highlightShaking) {
-                    u64 currentTime_ns = armTicksToNs(armGetSystemTick());
-                    t_ns = currentTime_ns - this->m_highlightShakingStartTime; // Changed
+                    t_ns = currentTime_ns - this->m_highlightShakingStartTime;
                     if (t_ns >= 100000000) // 100ms in nanoseconds
                         this->m_highlightShaking = false;
                     else {
-                        amplitude = std::rand() % 5 + 5;
+                        // Use cached amplitude like in drawClickAnimation
+                        static int cachedAmplitude = std::rand() % 5 + 5;
+                        if (t_ns % 10000000 == 0)
+                            cachedAmplitude = std::rand() % 5 + 5;
+                        amplitude = cachedAmplitude;
                         
+                        int shakeOffset = shakeAnimation(t_ns, amplitude);
                         switch (this->m_highlightShakingDirection) {
-                            case FocusDirection::Up:
-                                y -= shakeAnimation(t_ns, amplitude); // Changed parameter
-                                break;
-                            case FocusDirection::Down:
-                                y += shakeAnimation(t_ns, amplitude); // Changed parameter
-                                break;
-                            case FocusDirection::Left:
-                                x -= shakeAnimation(t_ns, amplitude); // Changed parameter
-                                break;
-                            case FocusDirection::Right:
-                                x += shakeAnimation(t_ns, amplitude); // Changed parameter
-                                break;
-                            default:
-                                break;
+                            case FocusDirection::Up:    y = -shakeOffset; break;
+                            case FocusDirection::Down:  y = shakeOffset; break;
+                            case FocusDirection::Left:  x = -shakeOffset; break;
+                            case FocusDirection::Right: x = shakeOffset; break;
+                            default: break;
                         }
                         
                         x = std::clamp(x, -amplitude, amplitude);
                         y = std::clamp(y, -amplitude, amplitude);
                     }
                 }
-                //if ((disableSelectionBG && this->m_clickAnimationProgress == 0) || !disableSelectionBG) {
+                
                 if (this->m_clickAnimationProgress == 0) {
                     if (!disableSelectionBG)
                         renderer->drawRect(this->getX() + x + 4, this->getY() + y, this->getWidth() - 12 +4, this->getHeight(), a(selectionBGColor)); // CUSTOM MODIFICATION 
-
+            
                     #if IS_LAUNCHER_DIRECTIVE
                     // Determine the active percentage to use
                     float activePercentage = 0.0f;
@@ -4314,16 +3671,13 @@ namespace tsl {
                         activePercentage = ult::copyPercentage;
                     }
                     if (activePercentage > 0){
-                        renderer->drawRect(this->getX() + x + 4, this->getY() + y, (this->getWidth()- 12 +4)*(activePercentage/100.0f), this->getHeight(), a(progressColor));
-                        //if (ult::copyPercentage == 100.0f) {
-                        //    ult::copyPercentage = -1;
-                        //}
+                        renderer->drawRect(this->getX() + x + 4, this->getY() + y, (this->getWidth()- 12 +4)*(activePercentage * 0.01f), this->getHeight(), a(progressColor)); // Direct percentage conversion
                     }
                     #endif
-
+            
                     renderer->drawBorderedRoundedRect(this->getX() + x, this->getY() + y, this->getWidth() +4, this->getHeight(), 5, 5, a(highlightColor));
                 }
-                //renderer->drawRect(ELEMENT_BOUNDS(this), a(0xF000)); // This has been moved here (needs to be toggleable)
+                
                 ult::onTrackBar = false;
             }
             
@@ -4424,7 +3778,7 @@ namespace tsl {
                 this->m_clickAnimationProgress = 0;
             }
 
-            virtual bool matchesJumpCriteria(const std::string& jumpText, const std::string& jumpValue) const {
+            virtual bool matchesJumpCriteria(const std::string& jumpText, const std::string& jumpValue, bool contains) const {
                 return false; // Default implementation for non-ListItem elements
             }
             
@@ -4516,6 +3870,7 @@ namespace tsl {
              */
             CustomDrawer(std::function<void(gfx::Renderer* r, s32 x, s32 y, s32 w, s32 h)> renderFunc) : Element(), m_renderFunc(renderFunc) {
                 m_isItem = false;
+                m_isTable = true;
             }
 
             virtual ~CustomDrawer() {}
@@ -4621,7 +3976,6 @@ namespace tsl {
                     tsl::initializeThemeVars(); // Initialize variables for ultrahand themes
                     ult::themeIsInitialized = true;
                 }
-
                 if (m_noClickableItems != ult::noClickableItems)
                     ult::noClickableItems = m_noClickableItems;
                 
@@ -4643,32 +3997,37 @@ namespace tsl {
                     renderer->drawRect(15, tsl::cfg::FramebufferHeight - 73, tsl::cfg::FramebufferWidth - 30, 1, a(botttomSeparatorColor));
                 
                 if (FullMode && !deactivateOriginalFooter) {
-                    ult::backWidth = tsl::gfx::calculateStringWidth(ult::BACK, 23);
+                    // Use getTextDimensions instead of calculateStringWidth
+                    auto [backWidth, backHeight] = renderer->getTextDimensions(ult::BACK, false, 23);
+                    ult::backWidth = backWidth;
+                    
                     if (ult::touchingBack) {
                         renderer->drawRoundedRect(18.0f, static_cast<float>(cfg::FramebufferHeight - 73), 
                                                   ult::backWidth+68.0f, 73.0f, 6.0f, a(clickColor));
                     }
-
-                    ult::selectWidth = tsl::gfx::calculateStringWidth(ult::OK, 23);
+                    
+                    // Use getTextDimensions instead of calculateStringWidth
+                    auto [selectWidth, selectHeight] = renderer->getTextDimensions(ult::OK, false, 23);
+                    ult::selectWidth = selectWidth;
+                    
                     if (ult::touchingSelect && !m_noClickableItems) {
                         renderer->drawRoundedRect(18.0f + ult::backWidth+68.0f, static_cast<float>(cfg::FramebufferHeight - 73), 
                                                   ult::selectWidth+68.0f, 73.0f, 6.0f, a(clickColor));
                     }
                 }
-
+                
                 if (m_noClickableItems)
                     menuBottomLine = "\uE0E1"+ult::GAP_2+ult::BACK+ult::GAP_1;
                 else
                     menuBottomLine = "\uE0E1"+ult::GAP_2+ult::BACK+ult::GAP_1+"\uE0E0"+ult::GAP_2+ult::OK+ult::GAP_1;
                 
-                //renderer->drawString(menuBottomLine.c_str(), false, 30, 693, 23, a(defaultTextColor));
                 // Render the text with special character handling
-                if (!deactivateOriginalFooter) renderer->drawStringWithColoredSections(menuBottomLine, {"\uE0E1","\uE0E0","\uE0ED","\uE0EE"}, 30, 693, 23, a(bottomTextColor), a(buttonColor));
+                if (!deactivateOriginalFooter) 
+                    renderer->drawStringWithColoredSections(menuBottomLine, false, {"\uE0E1","\uE0E0","\uE0ED","\uE0EE"}, 30, 693, 23, a(bottomTextColor), a(buttonColor));
                 
                 
                 if (this->m_contentElement != nullptr)
                     this->m_contentElement->frame(renderer);
-
             }
             
 
@@ -4819,7 +4178,7 @@ namespace tsl {
                     tsl::initializeThemeVars(); // Initialize variables for ultrahand themes
                     ult::themeIsInitialized = true;
                 }
-        
+            
                 if (m_noClickableItems != ult::noClickableItems)
                     ult::noClickableItems = m_noClickableItems;
                 
@@ -4833,12 +4192,12 @@ namespace tsl {
                 const bool isUltrahand = (m_title == ult::CAPITAL_ULTRAHAND_PROJECT_NAME && 
                                         m_subtitle.find("Ultrahand Package") == std::string::npos && 
                                         m_subtitle.find("Ultrahand Script") == std::string::npos);
-        
+            
                 if (isUltrahand) {
                 #if USING_WIDGET_DIRECTIVE
                     renderer->drawWidget();
                 #endif
-        
+            
                     if (ult::touchingMenu && ult::inMainMenu) {
                         renderer->drawRoundedRect(0.0f, 12.0f, 245.0f, 73.0f, 6.0f, a(clickColor));
                     }
@@ -4847,11 +4206,11 @@ namespace tsl {
                     fontSize = 42;
                     offset = 6;
                     countOffset = 0;
-        
+            
                     if (!disableColorfulLogo && ult::useDynamicLogo) {
                         const u64 currentTime_ns = armTicksToNs(armGetSystemTick());
                         const double currentTimeCount = currentTime_ns / 1000000000.0;
-        
+            
                         for (const char letter : ult::SPLIT_PROJECT_NAME_1) {
                             counter = (2 * ult::_M_PI * (std::fmod(currentTimeCount, cycleDuration) + countOffset) / 1.5);
                             progress = std::cos(counter - ult::_M_PI / 2.0);
@@ -4865,14 +4224,16 @@ namespace tsl {
                             
                             const std::string letterStr(1, letter);
                             renderer->drawString(letterStr, false, x, y + offset, fontSize, a(highlightColor));
-                            x += tsl::gfx::calculateStringWidth(letterStr, fontSize);
+                            auto [letterWidth, letterHeight] = renderer->getTextDimensions(letterStr, false, fontSize);
+                            x += letterWidth;
                             countOffset -= 0.2F;
                         }
                     } else {
                         for (const char letter : ult::SPLIT_PROJECT_NAME_1) {
                             const std::string letterStr(1, letter);
                             renderer->drawString(letterStr, false, x, y + offset, fontSize, a(logoColor1));
-                            x += tsl::gfx::calculateStringWidth(letterStr, fontSize);
+                            auto [letterWidth, letterHeight] = renderer->getTextDimensions(letterStr, false, fontSize);
+                            x += letterWidth;
                             countOffset -= 0.2F;
                         }
                     }
@@ -4883,7 +4244,7 @@ namespace tsl {
                     x = 20;
                     y = 52;
                     fontSize = 32;
-        
+            
                     if (m_subtitle.find("Ultrahand Script") != std::string::npos) {
                         renderer->drawString(m_title, false, x, y, fontSize, a(defaultScriptColor));
                     } else {
@@ -4947,7 +4308,7 @@ namespace tsl {
                                             
                                             const std::string letterStr(1, letter);
                                             renderer->drawString(letterStr.c_str(), false, x, y, fontSize, a(highlightColor));
-                                            letterWidth = tsl::gfx::calculateStringWidth(letterStr, fontSize);
+                                            auto [letterWidth, letterHeight] = renderer->getTextDimensions(letterStr, false, fontSize);
                                             x += letterWidth;
                                             counter -= 0.00004F;
                                         }
@@ -4977,7 +4338,7 @@ namespace tsl {
                     }
                     renderer->drawString(subtitle, false, 20, y+23, 15, a(versionTextColor));
                 }
-        
+            
             #else
                 {
                 #if USING_WIDGET_DIRECTIVE
@@ -4987,31 +4348,37 @@ namespace tsl {
                 renderer->drawString(m_title, false, 20, 52, 32, a(defaultOverlayColor));
                 renderer->drawString(m_subtitle, false, 20, y+23, 15, a(versionTextColor));
             #endif
-        
+            
                 renderer->drawRect(15, tsl::cfg::FramebufferHeight - 73, tsl::cfg::FramebufferWidth - 30, 1, a(botttomSeparatorColor));
                 
-                ult::backWidth = tsl::gfx::calculateStringWidth(ult::BACK, 23);
+                // Use getTextDimensions instead of calculateStringWidth
+                auto [backWidth, backHeight] = renderer->getTextDimensions(ult::BACK, false, 23);
+                ult::backWidth = backWidth;
                 if (ult::touchingBack) {
                     renderer->drawRoundedRect(18.0f, static_cast<float>(cfg::FramebufferHeight - 73), 
                                               ult::backWidth+68.0f, 73.0f, 6.0f, a(clickColor));
                 }
-        
-                ult::selectWidth = tsl::gfx::calculateStringWidth(ult::OK, 23);
+            
+                auto [selectWidth, selectHeight] = renderer->getTextDimensions(ult::OK, false, 23);
+                ult::selectWidth = selectWidth;
                 if (ult::touchingSelect && !m_noClickableItems) {
                     renderer->drawRoundedRect(18.0f + ult::backWidth+68.0f, static_cast<float>(cfg::FramebufferHeight - 73), 
                                               ult::selectWidth+68.0f, 73.0f, 6.0f, a(clickColor));
                 }
                 
             #if IS_LAUNCHER_DIRECTIVE
-                if (!m_pageLeftName.empty())
-                    ult::nextPageWidth = tsl::gfx::calculateStringWidth(m_pageLeftName, 23);
-                else if (!m_pageRightName.empty())
-                    ult::nextPageWidth = tsl::gfx::calculateStringWidth(m_pageRightName, 23);
-                else if (ult::inMainMenu) {
-                    ult::nextPageWidth = tsl::gfx::calculateStringWidth(
-                        ult::inOverlaysPage ? ult::PACKAGES : ult::OVERLAYS, 23);
+                if (!m_pageLeftName.empty()) {
+                    auto [pageWidth, pageHeight] = renderer->getTextDimensions(m_pageLeftName, false, 23);
+                    ult::nextPageWidth = pageWidth;
+                } else if (!m_pageRightName.empty()) {
+                    auto [pageWidth, pageHeight] = renderer->getTextDimensions(m_pageRightName, false, 23);
+                    ult::nextPageWidth = pageWidth;
+                } else if (ult::inMainMenu) {
+                    auto [pageWidth, pageHeight] = renderer->getTextDimensions(
+                        ult::inOverlaysPage ? ult::PACKAGES : ult::OVERLAYS, false, 23);
+                    ult::nextPageWidth = pageWidth;
                 }
-        
+            
                 if (ult::inMainMenu || !m_pageLeftName.empty() || !m_pageRightName.empty()) {
                     if (ult::touchingNextPage) {
                         renderer->drawRoundedRect(18.0f + ult::backWidth+68.0f + ((!m_noClickableItems) ? ult::selectWidth+68.0f : 0), 
@@ -5020,7 +4387,7 @@ namespace tsl {
                     }
                 }
             #endif
-        
+            
                 // Pre-build menu bottom line efficiently
                 menuBottomLine.clear();
                 menuBottomLine.reserve(128); // Reserve space to avoid reallocations
@@ -5029,7 +4396,7 @@ namespace tsl {
                 if (!m_noClickableItems) {
                     menuBottomLine += "\uE0E0" + ult::GAP_2 + ult::OK + ult::GAP_1;
                 }
-        
+            
             #if IS_LAUNCHER_DIRECTIVE
                 if (!ult::usePageSwap) {
                     if (m_menuMode == "packages") {
@@ -5054,8 +4421,8 @@ namespace tsl {
                 
                 // Render the text with special character handling
                 static const std::vector<std::string> specialChars = {"\uE0E1","\uE0E0","\uE0ED","\uE0EE"};
-                renderer->drawStringWithColoredSections(menuBottomLine, specialChars, 30, 693, 23, a(bottomTextColor), a(buttonColor));
-        
+                renderer->drawStringWithColoredSections(menuBottomLine, false, specialChars, 30, 693, 23, a(bottomTextColor), a(buttonColor));
+            
             #if USING_FPS_INDICATOR_DIRECTIVE
                 // Update and display FPS
                 const u64 currentTime_ns = armTicksToNs(armGetSystemTick());
@@ -5073,7 +4440,7 @@ namespace tsl {
                 
                 renderer->drawString(fpsBuffer, false, 20, tsl::cfg::FramebufferHeight - 60, 20, a(tsl::Color(0xFF, 0xFF, 0xFF, 0xFF)));
             #endif
-        
+            
                 if (m_contentElement != nullptr)
                     m_contentElement->frame(renderer);
             }
@@ -5166,11 +4533,8 @@ namespace tsl {
                     tsl::initializeThemeVars(); // Initialize variables for ultrahand themes
                     ult::themeIsInitialized = true;
                 }
-
                 renderer->fillScreen(a(defaultBackgroundColor));
-
                 renderer->drawWallpaper();
-
                 //renderer->fillScreen(tsl::style::color::ColorFrameBackground);
                 renderer->drawRect(tsl::cfg::FramebufferWidth - 1, 0, 1, tsl::cfg::FramebufferHeight, a(0xF222));
                 
@@ -5178,21 +4542,24 @@ namespace tsl {
                 
                 //renderer->drawString(("\uE0E1  "+ult::BACK+"     \uE0E0  "+ult::OK), false, 30, 693, 23, a(defaultTextColor)); // CUSTOM MODIFICATION
                 
-                ult::backWidth = tsl::gfx::calculateStringWidth(ult::BACK, 23);
+                // Use getTextDimensions instead of calculateStringWidth
+                auto [backWidth, backHeight] = renderer->getTextDimensions(ult::BACK, false, 23);
+                ult::backWidth = backWidth;
                 if (ult::touchingBack) {
                     renderer->drawRoundedRect(18.0f, static_cast<float>(cfg::FramebufferHeight - 73), 
                                               ult::backWidth+68.0f, 73.0f, 6.0f, a(clickColor));
                 }
-
-                ult::selectWidth = tsl::gfx::calculateStringWidth(ult::OK, 23);
+                
+                auto [selectWidth, selectHeight] = renderer->getTextDimensions(ult::OK, false, 23);
+                ult::selectWidth = selectWidth;
                 if (ult::touchingSelect) {
                     renderer->drawRoundedRect(18.0f + ult::backWidth+68.0f, static_cast<float>(cfg::FramebufferHeight - 73), 
                                               ult::selectWidth+68.0f, 73.0f, 6.0f, a(clickColor));
                 }
-
+                
                 std::string menuBottomLine = "\uE0E1"+ult::GAP_2+ult::BACK+ult::GAP_1+"\uE0E0"+ult::GAP_2+ult::OK+ult::GAP_1;
-                renderer->drawStringWithColoredSections(menuBottomLine, {"\uE0E1","\uE0E0","\uE0ED","\uE0EE"}, 30, 693, 23, a(bottomTextColor), a(buttonColor));
-
+                renderer->drawStringWithColoredSections(menuBottomLine, false, {"\uE0E1","\uE0E0","\uE0ED","\uE0EE"}, 30, 693, 23, a(bottomTextColor), a(buttonColor));
+                
                 if (this->m_header != nullptr)
                     this->m_header->frame(renderer);
                 
@@ -5302,10 +4669,8 @@ namespace tsl {
         class ListItem; // forward declaration
 
         static std::vector<Element*> s_lastFrameItems;
+        static bool s_isForwardCache = false; // NEW VARIABLE FOR FORWARD CACHING
         static bool s_hasValidFrame = false;
-        static float s_lastFrameOffset = 0.0f;
-        static size_t s_cachedInstanceId = 0;
-        static size_t s_nextInstanceId = 1; 
         static s32 s_cachedTopBound = 0;
         static s32 s_cachedBottomBound = 0;
         static s32 s_cachedHeight = 0;
@@ -5316,19 +4681,24 @@ namespace tsl {
         static u32 s_cachedScrollbarOffset = 0;
         static u32 s_cachedScrollbarX = 0;
         static u32 s_cachedScrollbarY = 0;
+        static bool cacheForwardFrameOnce = true;
+
+        static bool isTableScrolling = false;
 
         class List : public Element {
         
         public:
-            List() : Element(), m_instanceId(generateInstanceId()) {
+            List() : Element() {
+                cacheForwardFrameOnce = true;
                 m_isItem = false;
+                
             }
             virtual ~List() {
-                
-                if (s_cachedInstanceId == m_instanceId && jumpItemName.empty() ) {
-                    clearItems();
-                    clearStaticCache();
-                }
+                if (s_isForwardCache)
+                    clearStaticCache(true);
+                cacheCurrentFrame();
+                cacheForwardFrameOnce = true;
+                s_isForwardCache = false;
             }
             
             
@@ -5344,21 +4714,26 @@ namespace tsl {
                 if (!m_itemsToRemove.empty()) removePendingItems();
 
                 static bool checkOnce = true;
-                if (m_pendingJump && !s_hasValidFrame && !jumpItemName.empty() && checkOnce) {
+                if (m_pendingJump && !s_hasValidFrame && !s_isForwardCache && checkOnce) {
                     checkOnce = false;
                     return;
                 } else {
                     checkOnce = true;
                 }
 
-                if (m_pendingJump && s_hasValidFrame) {
+                if (m_pendingJump && (s_hasValidFrame || s_isForwardCache) && !m_skipFrame) {
                     // Render using cached frame state if available
                     renderCachedFrame(renderer);
-                    clearStaticCache();
+                    if (s_isForwardCache)
+                        clearStaticCache(true);
+                    else
+                        clearStaticCache();
+                    s_isForwardCache = false;
+                    s_hasValidFrame = false;
                     return;
+                } else {
+                    m_skipFrame = false;
                 }
-
-                cacheCurrentFrame();
 
                 // Cache bounds for hot loop
                 const s32 topBound = getTopBound();
@@ -5390,8 +4765,23 @@ namespace tsl {
                     drawScrollbar(renderer, height);
                     updateScrollAnimation();
                 }
+
+                if (!s_isForwardCache && s_hasValidFrame)
+                    clearStaticCache(); // clear cache after rendering (for smoother transitions)
+                
+                if (cacheForwardFrameOnce && !s_hasValidFrame) {
+                    s_lastFrameItems.clear();
+                    s_lastFrameItems.shrink_to_fit();
+                    s_lastFrameItems = m_items;
+                    s_isForwardCache = true;
+                    cacheForwardFrameOnce = false;
+                }
+
+                if (s_isForwardCache)
+                    cacheCurrentFrame(true);
                 
             }
+
         
             virtual void layout(u16 parentX, u16 parentY, u16 parentWidth, u16 parentHeight) override {
                 y = getY() - m_offset;
@@ -5426,9 +4816,8 @@ namespace tsl {
                         m_nextOffset = std::clamp(m_nextOffset, 0.0f, 
                             static_cast<float>(m_listHeight - getHeight()));
                         
-                        // FIXED: Always detect table state based on current scroll position
-                        // This ensures we're in the correct table context regardless of where we scroll
-                        detectAndEnterTableAtOffset();
+                        // Track that we're touch scrolling
+                        m_touchScrollActive = true;
                     }
                     return true;
                 }
@@ -5436,55 +4825,6 @@ namespace tsl {
                 return false;
             }
             
-            // Fixed syncTableStateFromOffset - only called during controller navigation
-            inline void syncTableStateFromOffset() {
-                // FIXED: Only sync during controller mode to prevent conflicts
-                if (Element::getInputMode() != InputMode::Controller) return;
-                if (!isInTable || tableIndex >= m_items.size()) return;
-                
-                float tableStartPos = calculateTableStartPosition(tableIndex);
-                float relativeOffset = m_offset - tableStartPos;
-                
-                Element* table = m_items[tableIndex];
-                float maxTableScroll = static_cast<float>(table->getHeight() - getHeight());
-                tableScrollOffset = std::clamp(relativeOffset, 0.0f, maxTableScroll);
-            }
-            
-            // Fixed detectAndEnterTableAtOffset - only called during controller navigation
-            inline void detectAndEnterTableAtOffset() {
-                // Always reset first, then detect based on current position
-                //bool wasInTable = isInTable;
-                //size_t oldTableIndex = tableIndex;
-                resetTableState();
-                
-                float currentPos = 0.0f;
-                float itemHeight;
-                
-                float maxTableScroll;
-
-                for (size_t i = 0; i < m_items.size(); ++i) {
-                    itemHeight = static_cast<float>(m_items[i]->getHeight());
-                    
-                    // Check if current offset falls within this item
-                    if (m_offset >= currentPos && m_offset < currentPos + itemHeight) {
-                        m_focusedIndex = i;
-                        
-                        // If this item is a table that can be entered
-                        if (canEnterTable(i)) {
-                            isInTable = true;
-                            tableIndex = i;
-                            tableScrollOffset = m_offset - currentPos;
-                            
-                            // Ensure table scroll offset is within bounds
-                            Element* table = m_items[i];
-                            maxTableScroll = static_cast<float>(table->getHeight() - getHeight());
-                            tableScrollOffset = std::clamp(tableScrollOffset, 0.0f, maxTableScroll);
-                        }
-                        break;
-                    }
-                    currentPos += itemHeight;
-                }
-            }
 
             inline void addItem(Element* element, u16 height = 0, ssize_t index = -1) {
                 if (!element) return;
@@ -5557,10 +4897,15 @@ namespace tsl {
                 return oldFocus;
             }
 
-            inline void jumpToItem(const std::string& text = "", const std::string& value = "") {
-                m_pendingJump = true;
+            inline void jumpToItem(const std::string& text = "", const std::string& value = "", bool exactMatch=true, bool skipFrame=false) {
+                if (!text.empty() || !value.empty())
+                    m_pendingJump = true;
+                else
+                    m_pendingJump = false;
                 m_jumpToText = text;
                 m_jumpToValue = value;
+                m_jumpToExactMatch = exactMatch;
+                m_skipFrame = skipFrame;
             }
                         
             virtual Element* getItemAtIndex(u32 index) {
@@ -5582,7 +4927,7 @@ namespace tsl {
                     updateScrollOffset();
                 }
             }
-        
+            
             inline void onDirectionalKeyReleased() {
                 m_hasWrappedInCurrentSequence = false;
                 m_lastNavigationResult = NavigationResult::None;
@@ -5605,7 +4950,7 @@ namespace tsl {
             std::vector<float> prefixSums;
             
             // Instance identification
-            const size_t m_instanceId;
+            //const size_t m_instanceId;
 
             // Enhanced navigation state tracking
             bool m_justWrapped = false;
@@ -5619,22 +4964,23 @@ namespace tsl {
             // Jump to navigation variables
             std::string m_jumpToText;
             std::string m_jumpToValue;
+            bool m_jumpToExactMatch = false;
             bool m_pendingJump = false;
+            bool m_skipFrame = false;
 
             // Stack variables for hot path - reused to avoid allocations
             u32 scrollbarHeight;
             u32 scrollbarOffset;
             u32 prevOffset;
-        
+            
             static constexpr float smoothingFactor = 0.15f;
             static constexpr float dampingFactor = 0.3f;
-            static constexpr float TABLE_SCROLL_STEP_SIZE = 40.0f;
-        
-            // Simplified table state - just track which table and its scroll position
-            bool isInTable = false;
-            size_t tableIndex = 0;
-            float tableScrollOffset = 0.0f;  // Offset within the table itself
+            static constexpr float TABLE_SCROLL_STEP_SIZE = 13;
+            static constexpr float TABLE_SCROLL_STEP_SIZE_CLICK = 40;
+            float m_scrollVelocity = 0.0f;
             
+            bool m_touchScrollActive = false;
+
             enum class NavigationResult {
                 None,
                 Success,
@@ -5647,28 +4993,40 @@ namespace tsl {
         
         private:
             // Method to explicitly preserve cache when navigating away
-            void preserveCacheForReturn() {
-                if (m_instanceId == s_cachedInstanceId && s_hasValidFrame) {
-                    // Cache is already preserved for this instance
-                    return;
-                }
-                cacheCurrentFrame();
-            }
+            //void preserveCacheForReturn() {
+            //    if (m_instanceId == s_cachedInstanceId && s_hasValidFrame) {
+            //        // Cache is already preserved for this instance
+            //        return;
+            //    }
+            //    cacheCurrentFrame();
+            //}
         
             // Method to check if this instance has a valid cached frame
-            bool hasCachedFrame() const {
-                return s_hasValidFrame && s_cachedInstanceId == m_instanceId;
-            }
+            //bool hasCachedFrame() const {
+            //    return s_hasValidFrame && s_cachedInstanceId == m_instanceId;
+            //}
 
-            static size_t generateInstanceId() {
-                return s_nextInstanceId++;
-            }
+            //static size_t generateInstanceId() {
+            //    return s_nextInstanceId++;
+            //}
         
-            static void clearStaticCache() {
-                s_lastFrameItems.clear();
-                s_hasValidFrame = false;
-                s_lastFrameOffset = 0.0f;
-                s_cachedInstanceId = 0;
+            static void clearStaticCache(bool preservePointers = false) {
+                if (preservePointers) {
+                    // For forward cache: just clear the vector without deleting elements
+                    s_lastFrameItems.clear();
+                    s_lastFrameItems.shrink_to_fit();
+                } else {
+                    // Normal case: delete elements and clear
+                    for (Element* el : s_lastFrameItems) {
+                        delete el;
+                    }
+                    s_lastFrameItems.clear();
+                    s_lastFrameItems.shrink_to_fit();
+                }
+                
+                // CRITICAL: Always reset these, even for forward cache!
+                s_hasValidFrame = false;  // This MUST be false after clearing
+                s_isForwardCache = false;
                 s_cachedTopBound = 0;
                 s_cachedBottomBound = 0;
                 s_cachedHeight = 0;
@@ -5680,15 +5038,41 @@ namespace tsl {
                 s_cachedScrollbarX = 0;
                 s_cachedScrollbarY = 0;
             }
-        
-            void cacheCurrentFrame() {
-                s_lastFrameItems = m_items;
-                s_lastFrameOffset = m_offset;
-                s_cachedInstanceId = m_instanceId;
+
+                    
+            void cacheCurrentFrame(bool isForwardCache = false) {
+
+                if (!isForwardCache) {
+                    // Clear previous cache (including memory!)
+                    for (Element* el : s_lastFrameItems) {
+                        delete el;
+                    }
+                    s_lastFrameItems.clear();
+                    s_lastFrameItems.shrink_to_fit();
+                }
                 
-                // Cache all the bounds and calculations
-                s_cachedTopBound = getTopBound();
-                s_cachedBottomBound = getBottomBound();
+                // Cache bounds for visibility calculations
+                const s32 topBound = getTopBound();
+                const s32 bottomBound = getBottomBound();
+                
+                // Only cache items that are actually visible (or partially visible)
+                //s_lastFrameItems.reserve(m_items.size()); // Reserve full size to avoid reallocations
+                //for (Element* element : m_items) {
+                //    // Only cache items that are in the visible area
+                //    //if (element->getBottomBound() > topBound && element->getTopBound() < bottomBound) {
+                //    s_lastFrameItems.push_back(element);
+                //    //}
+                //}
+                if (!isForwardCache) {
+                    s_lastFrameItems.clear();
+                    s_lastFrameItems.shrink_to_fit();
+                    s_lastFrameItems = m_items;
+                }
+                
+                
+                // Cache all the bounds and calculations (unchanged)
+                s_cachedTopBound = topBound;
+                s_cachedBottomBound = bottomBound;
                 s_cachedHeight = getHeight();
                 s_cachedListHeight = m_listHeight;
                 
@@ -5699,7 +5083,7 @@ namespace tsl {
                 }
                 s_cachedActualContentBottom = actualContentBottom;
                 
-                // Cache scrollbar parameters
+                // Cache scrollbar parameters (unchanged - uses full m_listHeight for correct sizing)
                 s_shouldDrawScrollbar = (s_cachedListHeight-20 > s_cachedHeight || s_cachedActualContentBottom-20 > s_cachedHeight);
                 
                 if (s_shouldDrawScrollbar) {
@@ -5711,15 +5095,16 @@ namespace tsl {
                                                      static_cast<u32>(viewHeight));
                     
                     s_cachedScrollbarOffset = std::min(static_cast<u32>((m_offset / maxScrollableHeight) * (viewHeight - s_cachedScrollbarHeight)), 
-                                                     static_cast<u32>(viewHeight - s_cachedScrollbarHeight)) + 4;
+                                                     static_cast<u32>(viewHeight - s_cachedScrollbarOffset)) + 4;
             
                     s_cachedScrollbarX = getRightBound() + 20;
                     s_cachedScrollbarY = getY() + s_cachedScrollbarOffset + 2;
                 }
-                
-                s_hasValidFrame = true;
+                //s_isForwardCache = isForwardCache;
+                if (!isForwardCache)
+                    s_hasValidFrame = true;
             }
-                        
+                                    
             void renderCachedFrame(gfx::Renderer* renderer) {
                 renderer->enableScissoring(getLeftBound(), s_cachedTopBound, getWidth() + 8, s_cachedHeight + 4);
             
@@ -5731,8 +5116,6 @@ namespace tsl {
                 
                 renderer->disableScissoring();
                 
-                //m_offset = s_lastFrameOffset;
-                
                 // Draw cached scrollbar
                 if (s_shouldDrawScrollbar) {
                     renderer->drawRect(s_cachedScrollbarX, s_cachedScrollbarY, 5, s_cachedScrollbarHeight, a(trackBarColor));
@@ -5742,11 +5125,11 @@ namespace tsl {
             }
 
 
-            inline void clearItems() {
+            void clearItems() {
                 // Clear static cache if it belongs to this instance
-                if (s_cachedInstanceId == m_instanceId) {
-                    clearStaticCache();
-                }
+                //if (s_cachedInstanceId == m_instanceId) {
+                //    clearStaticCache();
+                //}
 
                 for (Element* item : m_items) delete item;
                 m_items.clear();
@@ -5755,10 +5138,9 @@ namespace tsl {
                 invalidate();
                 m_clearList = false;
                 actualItemCount = 0;
-                resetTableState();
             }
             
-            inline void addPendingItems() {
+            void addPendingItems() {
                 for (auto [index, element] : m_itemsToAdd) {
                     element->invalidate();
                     if (index >= 0 && static_cast<size_t>(index) < m_items.size()) {
@@ -5772,7 +5154,7 @@ namespace tsl {
                 updateScrollOffset();
             }
             
-            inline void removePendingItems() {
+            void removePendingItems() {
                 size_t index;
                 for (Element* element : m_itemsToRemove) {
                     auto it = std::find(m_items.begin(), m_items.end(), element);
@@ -5790,7 +5172,7 @@ namespace tsl {
                 updateScrollOffset();
             }
             
-            inline void drawScrollbar(gfx::Renderer* renderer, s32 height) {
+            void drawScrollbar(gfx::Renderer* renderer, s32 height) {
                 const float viewHeight = static_cast<float>(height - 10);
                 const float totalHeight = static_cast<float>(m_listHeight-22);
                 const u32 maxScrollableHeight = std::max(static_cast<u32>(totalHeight - viewHeight), 1u);
@@ -5808,20 +5190,111 @@ namespace tsl {
                 renderer->drawCircle(scrollbarX + 2, scrollbarY, 2, true, a(trackBarColor));
                 renderer->drawCircle(scrollbarX + 2, scrollbarY + scrollbarHeight, 2, true, a(trackBarColor));
             }
-        
+
+            
             inline void updateScrollAnimation() {
+                                
                 if (Element::getInputMode() == InputMode::Controller) {
-                    static float velocity = 0.0f;
-                    velocity = velocity * dampingFactor + (m_nextOffset - m_offset) * smoothingFactor;
+                    // Clear touch flag when in controller mode
+                    m_touchScrollActive = false;
                     
-                    if (std::abs(velocity) < 0.2f) {
-                        m_offset = m_nextOffset;
-                        velocity = 0.0f;
-                    } else {
-                        m_offset += velocity;
+                    // Emergency correction if item is going out of bounds (unchanged)
+                    if (m_focusedIndex < m_items.size()) {
+                        float itemTop = 0.0f;
+                        for (size_t i = 0; i < m_focusedIndex; ++i) {
+                            itemTop += m_items[i]->getHeight();
+                        }
+                        float itemBottom = itemTop + m_items[m_focusedIndex]->getHeight();
+                        
+                        float viewTop = m_offset;
+                        float viewBottom = m_offset + getHeight();
+                        
+                        if (itemTop < viewTop || itemBottom > viewBottom) {
+                            float diff = m_nextOffset - m_offset;
+                            float emergencySpeed = 0.6f;
+                            
+                            if (itemBottom < viewTop || itemTop > viewBottom) {
+                                emergencySpeed = 0.9f;
+                            }
+                            
+                            m_offset += diff * emergencySpeed;
+                            m_scrollVelocity = diff * 0.3f;
+                            
+                            if (prevOffset != m_offset) {
+                                invalidate();
+                                prevOffset = m_offset;
+                            }
+                            return;
+                        }
                     }
+                    
+                    // Calculate distance to target
+                    float diff = m_nextOffset - m_offset;
+                    float distance = std::abs(diff);
+                    
+                    // SIMPLE BOUNDARY SNAPPING: Just handle normal cases
+                    if (distance < 0.5f) {
+                        m_offset = m_nextOffset;
+                        m_scrollVelocity = 0.0f;
+                        
+                        if (prevOffset != m_offset) {
+                            invalidate();
+                            prevOffset = m_offset;
+                        }
+                        return;
+                    }
+                    
+                    // ORIGINAL SMOOTH SCROLLING LOGIC (completely unchanged)
+                    bool isLargeJump = distance > getHeight() * 1.5f;
+                    bool isFromRest = std::abs(m_scrollVelocity) < 2.0f;
+                    
+                    if (isLargeJump && isFromRest) {
+                        float gentleAcceleration = 0.08f;
+                        float gentleDamping = 0.85f;
+                        
+                        float targetVelocity = diff * gentleAcceleration;
+                        m_scrollVelocity += (targetVelocity - m_scrollVelocity) * gentleDamping;
+                    } else {
+                        float urgency = std::min(distance / getHeight(), 1.0f);
+                        float accelerationFactor = 0.18f + (0.24f * urgency);
+                        float dampingFactor = 0.48f - (0.18f * urgency);
+                        
+                        float targetVelocity = diff * accelerationFactor;
+                        m_scrollVelocity += (targetVelocity - m_scrollVelocity) * dampingFactor;
+                    }
+                    
+                    // Apply velocity
+                    m_offset += m_scrollVelocity;
+                    
+                    // Prevent overshoot
+                    if ((m_scrollVelocity > 0 && m_offset > m_nextOffset) ||
+                        (m_scrollVelocity < 0 && m_offset < m_nextOffset)) {
+                        m_offset = m_nextOffset;
+                        m_scrollVelocity = 0.0f;
+                    }
+                
                 } else if (Element::getInputMode() == InputMode::TouchScroll) {
-                    m_offset += (m_nextOffset - m_offset);
+                    m_offset = m_nextOffset;
+                    m_scrollVelocity = 0.0f;
+                    
+                    // When touch scrolling, update focused index to match visible area
+                    if (m_touchScrollActive) {
+                        float viewCenter = m_offset + (getHeight() / 2.0f);
+                        float accumHeight = 0.0f;
+                        
+                        float itemHeight, itemCenter;
+                        for (size_t i = 0; i < m_items.size(); ++i) {
+                            itemHeight = m_items[i]->getHeight();
+                            itemCenter = accumHeight + (itemHeight / 2.0f);
+                            
+                            if (itemCenter >= viewCenter) {
+                                m_focusedIndex = i;
+                                break;
+                            }
+                            
+                            accumHeight += itemHeight;
+                        }
+                    }
                 }
                 
                 if (prevOffset != m_offset) {
@@ -5829,64 +5302,72 @@ namespace tsl {
                     prevOffset = m_offset;
                 }
             }
-                                
+                                            
             Element* handleInitialFocus(Element* oldFocus) {
                 size_t startIndex = 0;
-                bool shouldDetectTable = false;
                 
-                // Calculate starting index based on current scroll position (original logic)
-                if (!oldFocus) {
-                    s32 elementHeight = 0;
+                // Calculate starting index based on current scroll position
+                if (!oldFocus && m_offset > 0) {
+                    float elementHeight = 0.0f;
                     while (elementHeight < m_offset && startIndex < m_items.size() - 1) {
-                        elementHeight += m_items[++startIndex]->getHeight();
+                        elementHeight += m_items[startIndex]->getHeight();
+                        startIndex++;
                     }
-                    // Only detect table mode if we're resuming from a non-zero scroll position
-                    shouldDetectTable = (m_offset > 0);
                 }
                 
                 resetNavigationState();
                 
+                // Save current offset to prevent scroll jumping
+                float savedOffset = m_offset;
+                float savedNextOffset = m_nextOffset;
+                
                 // Try to focus items starting from the calculated index
                 for (size_t i = startIndex; i < m_items.size(); ++i) {
-                    Element* newFocus = m_items[i]->requestFocus(oldFocus, FocusDirection::None);
-                    if (newFocus && newFocus != oldFocus) {
-                        m_focusedIndex = i;
-                        
-                        // Only detect table mode if we're restoring from a previous scroll position
-                        if (shouldDetectTable) {
-                            detectAndEnterTableAtOffset();
+                    if (!m_items[i]->isTable()) {
+                        Element* newFocus = m_items[i]->requestFocus(oldFocus, FocusDirection::None);
+                        if (newFocus && newFocus != oldFocus) {
+                            m_focusedIndex = i;
+                            // Restore the scroll position to prevent jumping
+                            m_offset = savedOffset;
+                            m_nextOffset = savedNextOffset;
+                            return newFocus;
                         }
-                        
-                        // Only update scroll offset if we're not in a table
-                        if (!isInTable) {
-                            updateScrollOffset();
-                        }
-                        
-                        return newFocus;
                     }
                 }
                 
                 // If nothing found from startIndex onwards, try from beginning
                 for (size_t i = 0; i < startIndex && i < m_items.size(); ++i) {
-                    Element* newFocus = m_items[i]->requestFocus(oldFocus, FocusDirection::None);
-                    if (newFocus && newFocus != oldFocus) {
-                        m_focusedIndex = i;
-                        
-                        // For items before startIndex, we're not restoring position, so no table detection
-                        updateScrollOffset();
-                        
-                        return newFocus;
+                    if (!m_items[i]->isTable()) {
+                        Element* newFocus = m_items[i]->requestFocus(oldFocus, FocusDirection::None);
+                        if (newFocus && newFocus != oldFocus) {
+                            m_focusedIndex = i;
+                            // Restore the scroll position to prevent jumping
+                            m_offset = savedOffset;
+                            m_nextOffset = savedNextOffset;
+                            return newFocus;
+                        }
                     }
                 }
                 
                 return nullptr;
             }
-                                                                                            
+            
+                                                                                                                                
             inline Element* handleDownFocus(Element* oldFocus) {
                 updateHoldState();
                 
-                // FIXED: Only stop at boundary for non-table navigation
-                if (m_isHolding && m_stoppedAtBoundary && !isInTable) {
+                // Check if the next item is non-focusable BEFORE we do anything else
+                if (m_focusedIndex + 1 < int(m_items.size())) {
+                    Element* nextItem = m_items[m_focusedIndex + 1];
+                    if (nextItem->isTable() || nextItem->requestFocus(nullptr, FocusDirection::None) == nullptr) {
+                        isTableScrolling = true;  // Set this IMMEDIATELY
+                    }
+                }
+                
+                // If holding and at boundary, try to scroll first
+                if (m_isHolding && m_stoppedAtBoundary && canScrollDown()) {
+                    scrollDown();
+                    m_stoppedAtBoundary = false;
                     return oldFocus;
                 }
                 
@@ -5898,26 +5379,42 @@ namespace tsl {
                     return result;
                 }
                 
-                // At boundary - check for wrapping
-                if (!m_isHolding && !m_hasWrappedInCurrentSequence && isAtAbsoluteBottom()) {
+                // Check if we can still scroll down
+                if (canScrollDown()) {
+                    scrollDown();
+                    return oldFocus;
+                }
+                
+                // At absolute bottom - check for wrapping
+                if (!m_isHolding && !m_hasWrappedInCurrentSequence && isAtBottom()) {
                     m_hasWrappedInCurrentSequence = true;
                     m_lastNavigationResult = NavigationResult::Wrapped;
                     return wrapToTop(oldFocus);
                 }
                 
-                // FIXED: Only set boundary stop for non-table items
-                if (m_isHolding && !isInTable) {
+                // Set boundary flag
+                if (m_isHolding) {
                     m_stoppedAtBoundary = true;
                 }
                 m_lastNavigationResult = NavigationResult::HitBoundary;
                 return oldFocus;
             }
-        
+            
             inline Element* handleUpFocus(Element* oldFocus) {
                 updateHoldState();
                 
-                // FIXED: Only stop at boundary for non-table navigation
-                if (m_isHolding && m_stoppedAtBoundary && !isInTable) {
+                // Check if the previous item is non-focusable BEFORE we do anything else
+                if (m_focusedIndex > 0) {
+                    Element* prevItem = m_items[m_focusedIndex - 1];
+                    if (prevItem->isTable() || prevItem->requestFocus(nullptr, FocusDirection::None) == nullptr) {
+                        isTableScrolling = true;  // Set this IMMEDIATELY
+                    }
+                }
+                
+                // If holding and at boundary, try to scroll first
+                if (m_isHolding && m_stoppedAtBoundary && canScrollUp()) {
+                    scrollUp();
+                    m_stoppedAtBoundary = false;
                     return oldFocus;
                 }
                 
@@ -5929,24 +5426,54 @@ namespace tsl {
                     return result;
                 }
                 
-                // At boundary - check for wrapping
-                if (!m_isHolding && !m_hasWrappedInCurrentSequence && isAtAbsoluteTop()) {
+                // Check if we can still scroll up
+                if (canScrollUp()) {
+                    scrollUp();
+                    return oldFocus;
+                }
+                
+                // At absolute top - check for wrapping
+                if (!m_isHolding && !m_hasWrappedInCurrentSequence && isAtTop()) {
                     m_hasWrappedInCurrentSequence = true;
                     m_lastNavigationResult = NavigationResult::Wrapped;
                     return wrapToBottom(oldFocus);
                 }
                 
-                // FIXED: Only set boundary stop for non-table items
-                if (m_isHolding && !isInTable) {
+                // Set boundary flag
+                if (m_isHolding) {
                     m_stoppedAtBoundary = true;
                 }
                 m_lastNavigationResult = NavigationResult::HitBoundary;
                 return oldFocus;
             }
-        
+                        
+            inline bool isAtTop() {
+                // We're at top if we're scrolled to the very beginning AND focused on first element
+                bool scrolledToTop = (m_nextOffset <= 0.1f && m_offset <= 0.1f);
+                bool focusedOnFirst = (m_focusedIndex == 0);
+                return scrolledToTop && focusedOnFirst;
+            }
+            
+            inline bool isAtBottom() {
+                // We're at bottom if we can't scroll down AND focused on last element
+                bool cannotScrollDown = !canScrollDown();
+                bool focusedOnLast = (m_focusedIndex >= m_items.size() - 1);
+                return cannotScrollDown && focusedOnLast;
+            }
+
+            // Helper to check if there are any focusable items
+            inline bool hasAnyFocusableItems() {
+                for (size_t i = 0; i < m_items.size(); ++i) {
+                    Element* test = m_items[i]->requestFocus(nullptr, FocusDirection::None);
+                    if (test) return true;
+                }
+                return false;
+            }
+
+            
             inline void updateHoldState() {
                 u64 currentTime = armTicksToNs(armGetSystemTick());
-                if (m_lastNavigationTime != 0 && (currentTime - m_lastNavigationTime) < HOLD_THRESHOLD_NS) {
+                if ((m_lastNavigationTime != 0 && (currentTime - m_lastNavigationTime) < HOLD_THRESHOLD_NS)) {
                     m_isHolding = true;
                 } else {
                     m_isHolding = false;
@@ -5963,30 +5490,33 @@ namespace tsl {
                 m_stoppedAtBoundary = false;
                 m_lastNavigationTime = 0;
             }
-        
-            inline void resetTableState() {
-                isInTable = false;
-                tableIndex = 0;
-                tableScrollOffset = 0.0f;
-            }
 
             inline Element* handleJumpToItem(Element* oldFocus) {
-                resetTableState();
                 resetNavigationState();
                 invalidate();
-            
+                
                 const bool needsScroll = m_listHeight > getHeight();
-                const float viewportThird = needsScroll ? getHeight() / 3.0f : 0.0f;
-                const float maxOffset = needsScroll ? m_listHeight - getHeight() : 0.0f;
+                const float viewHeight = static_cast<float>(getHeight());
+                const float maxOffset = needsScroll ? m_listHeight - viewHeight : 0.0f;
                 
                 float h = 0.0f;
                 
+                float itemHeight, itemCenterPos, viewportCenter, idealOffset;
+
                 for (size_t i = 0; i < m_items.size(); ++i) {
                     m_focusedIndex = i;
                     
                     Element* newFocus = m_items[i]->requestFocus(oldFocus, FocusDirection::Down);
-                    if (newFocus && newFocus != oldFocus && m_items[i]->matchesJumpCriteria(m_jumpToText, m_jumpToValue)) {
-                        m_offset = m_nextOffset = needsScroll && i ? std::clamp(h - viewportThird, 0.0f, maxOffset) : 0.0f;
+                    if (newFocus && newFocus != oldFocus && m_items[i]->matchesJumpCriteria(m_jumpToText, m_jumpToValue, m_jumpToExactMatch)) {
+                        // CHANGED: Calculate center of the item and center it in viewport
+                        itemHeight = m_items[i]->getHeight();
+                        itemCenterPos = h + (itemHeight);
+                        viewportCenter = viewHeight / 2.0f;
+                        idealOffset = itemCenterPos - viewportCenter;
+                        
+                        // Clamp to valid bounds
+                        m_offset = m_nextOffset = std::max(0.0f, std::min(idealOffset, maxOffset));
+                        
                         return newFocus;
                     }
                     
@@ -5998,436 +5528,353 @@ namespace tsl {
             }
         
             // Core navigation logic
+            // Optimized version with variable definitions pulled outside the loop
             inline Element* navigateDown(Element* oldFocus) {
-                if (isInTable) {
-                    return handleTableNavigationDown(oldFocus);
-                }
+                size_t searchIndex = m_focusedIndex + 1;
                 
-                // FIXED: Check if we just wrapped AND we're still at a boundary
-                if (m_justWrapped) {
-                    m_justWrapped = false;
-                    // Only stay put if we're actually at the first item and there's a table after us
-                    if (m_focusedIndex == 0 || (m_focusedIndex < m_items.size() - 1 && canEnterTable(m_focusedIndex + 1))) {
-                        return oldFocus; // Stay on current item for one navigation cycle
+                // If currently on a table that needs more scrolling
+                if (m_focusedIndex < m_items.size() && m_items[m_focusedIndex]->isTable()) {
+                    Element* currentTable = m_items[m_focusedIndex];
+                    if (currentTable->getBottomBound() > getBottomBound()) {
+                        isTableScrolling = true;
+                        scrollDown();
+                        return oldFocus;
                     }
                 }
                 
-                // Look for next focusable item
-                for (size_t i = m_focusedIndex + 1; i < m_items.size(); ++i) {
-                    if (canEnterTable(i)) {
-                        return enterTable(oldFocus, i, true); // Enter from top
-                    } else if (canFocusRegularItem(i)) {
-                        m_focusedIndex = i;
+                // Variables pulled outside the loop for optimization
+                Element* item;
+                Element* newFocus;
+                s32 tableBottom;
+                s32 viewBottom = getBottomBound(); // Cached since it likely doesn't change during loop
+                float itemBottom;
+                float containerHeight = getHeight(); // Cache this as well since it's used in calculation
+                float offsetPlusHeight = m_offset + containerHeight; // Pre-calculate this sum
+                
+                while (searchIndex < m_items.size()) {
+                    item = m_items[searchIndex];
+                    m_focusedIndex = searchIndex;
+                    
+                    if (item->isTable()) {
+                        // Table needs scrolling
+                        tableBottom = item->getBottomBound();
+                        if (tableBottom > viewBottom) {
+                            isTableScrolling = true;
+                            scrollDown();
+                            return oldFocus;
+                        }
+                        searchIndex++;
+                        continue;
+                    }
+                    
+                    // Try to focus this item
+                    newFocus = item->requestFocus(oldFocus, FocusDirection::Down);
+                    if (newFocus && newFocus != oldFocus) {
+                        // ONLY reset when we successfully focus something
+                        isTableScrolling = false;
                         updateScrollOffset();
-                        return m_items[i]->requestFocus(oldFocus, FocusDirection::Down);
+                        return newFocus;
+                    } else {
+                        // Non-focusable item (gap/header)
+                        itemBottom = calculateItemPosition(searchIndex) + item->getHeight();
+                        if (itemBottom > offsetPlusHeight) {
+                            isTableScrolling = true;  // Treat gaps/headers like tables
+                            scrollDown();
+                            return oldFocus;
+                        }
+                        searchIndex++;
                     }
                 }
                 
                 return oldFocus;
             }
-
-                    
+            
+            // Optimized version with variable definitions pulled outside the loop
             inline Element* navigateUp(Element* oldFocus) {
-                if (isInTable) {
-                    return handleTableNavigationUp(oldFocus);
+                if (m_focusedIndex == 0) return oldFocus;
+                ssize_t searchIndex = static_cast<ssize_t>(m_focusedIndex) - 1;
+                
+                // If currently on a table that needs more scrolling
+                if (m_focusedIndex < m_items.size() && m_items[m_focusedIndex]->isTable()) {
+                    Element* currentTable = m_items[m_focusedIndex];
+                    if (currentTable->getTopBound() < getTopBound()) {
+                        isTableScrolling = true;
+                        scrollUp();
+                        return oldFocus;
+                    }
                 }
                 
-                // FIXED: If we just wrapped, don't immediately enter a table
-                if (m_justWrapped) {
-                    m_justWrapped = false;
-                    return oldFocus; // Stay on current item for one navigation cycle
-                }
+                // Variables pulled outside the loop for optimization
+                Element* item;
+                Element* newFocus;
+                s32 tableTop;
+                s32 viewTop = getTopBound(); // This can be cached since it likely doesn't change during loop
+                float itemTop;
                 
-                // Look for previous focusable item
-                for (ssize_t i = static_cast<ssize_t>(m_focusedIndex) - 1; i >= 0; --i) {
-                    //size_t idx = static_cast<size_t>(i);
-                    if (canEnterTable(i)) {
-                        return enterTable(oldFocus, i, false); // Enter from bottom
-                    } else if (canFocusRegularItem(i)) {
-                        m_focusedIndex = i;
+                while (searchIndex >= 0) {
+                    item = m_items[searchIndex];
+                    m_focusedIndex = static_cast<size_t>(searchIndex);
+                    
+                    if (item->isTable()) {
+                        // Table needs scrolling
+                        tableTop = item->getTopBound();
+                        if (tableTop < viewTop) {
+                            isTableScrolling = true;
+                            scrollUp();
+                            return oldFocus;
+                        }
+                        searchIndex--;
+                        continue;
+                    }
+                    
+                    // Try to focus this item
+                    newFocus = item->requestFocus(oldFocus, FocusDirection::Up);
+                    if (newFocus && newFocus != oldFocus) {
+                        // ONLY reset when we successfully focus something
+                        isTableScrolling = false;
                         updateScrollOffset();
-                        return m_items[i]->requestFocus(oldFocus, FocusDirection::Up);
+                        return newFocus;
+                    } else {
+                        // Non-focusable item (gap/header)
+                        itemTop = calculateItemPosition(static_cast<size_t>(searchIndex));
+                        if (itemTop < m_offset) {
+                            isTableScrolling = true;  // Treat gaps/headers like tables
+                            scrollUp();
+                            return oldFocus;
+                        }
+                        searchIndex--;
                     }
                 }
                 
                 return oldFocus;
-            }
-        
-            // Table navigation
-            inline Element* handleTableNavigationDown(Element* oldFocus) {
-                if (!canScrollTableDown()) {
-                    // Try to exit table downward
-                    return exitTableDown(oldFocus);
-                }
-                
-                // FIXED: Don't stop at boundary when holding - allow continuous scrolling
-                scrollTableDown();
-                return oldFocus;
-            }
-
-            inline Element* handleTableNavigationUp(Element* oldFocus) {
-                if (!canScrollTableUp()) {
-                    // Try to exit table upward
-                    return exitTableUp(oldFocus);
-                }
-                
-                // FIXED: Don't stop at boundary when holding - allow continuous scrolling
-                scrollTableUp();
-                return oldFocus;
-            }
-        
-            inline bool canScrollTableDown() {
-                if (tableIndex >= m_items.size()) return false;
-                
-                Element* table = m_items[tableIndex];
-                // FIXED: Add buffer to ensure we can see the very bottom content
-                float maxScroll = static_cast<float>(table->getHeight() - getHeight());
-                return tableScrollOffset < maxScroll && maxScroll > 0;
-            }
-        
-            inline bool canScrollTableUp() {
-                return tableScrollOffset > 0.0f;
-            }
-        
-            inline void scrollTableDown() {
-                if (tableIndex >= m_items.size()) return;
-                
-                Element* table = m_items[tableIndex];
-                // FIXED: Same buffer calculation as canScrollTableDown
-                float maxScroll = static_cast<float>(table->getHeight() - getHeight());
-                
-                tableScrollOffset = std::min(tableScrollOffset + TABLE_SCROLL_STEP_SIZE, maxScroll);
-                
-                // Update global scroll position
-                float tableStartPos = calculateTableStartPosition(tableIndex);
-                m_nextOffset = tableStartPos + tableScrollOffset;
-            }
-
-            inline void scrollTableUp() {
-                tableScrollOffset = std::max(tableScrollOffset - TABLE_SCROLL_STEP_SIZE, 0.0f);
-                
-                // Update global scroll position
-                float tableStartPos = calculateTableStartPosition(tableIndex);
-                m_nextOffset = tableStartPos + tableScrollOffset;
-            }
-        
-            inline float calculateTableStartPosition(size_t tableIdx) {
-                float pos = 0.0f;
-                for (size_t i = 0; i < tableIdx && i < m_items.size(); ++i) {
-                    pos += m_items[i]->getHeight();
-                }
-                return pos;
             }
             
-            Element* enterTable(Element* oldFocus, size_t tableIdx, bool fromTop) {
-                isInTable = true;
-                tableIndex = tableIdx;
-                m_focusedIndex = tableIdx;
-                
-                float tableStartPos = calculateTableStartPosition(tableIdx);
-                
-                if (fromTop) {
-                    tableScrollOffset = 0.0f;
-                    // FIXED: Use smooth animation when entering table from top
-                    m_nextOffset = 0;
-                } else {
-                    // Enter from bottom - scroll to show the bottom of the table
-                    Element* table = m_items[tableIdx];
-                    tableScrollOffset = static_cast<float>(table->getHeight() - getHeight());
-                    if (tableScrollOffset < 0) tableScrollOffset = 0.0f;
-                    
-                    // FIXED: Use smooth animation when entering table from bottom
-                    m_nextOffset = tableStartPos + tableScrollOffset;
+            
+            // Helper method to calculate an item's position in the list
+            inline float calculateItemPosition(size_t index) {
+                float position = 0.0f;
+                for (size_t i = 0; i < index && i < m_items.size(); ++i) {
+                    position += m_items[i]->getHeight();
                 }
-                
-                // Don't set m_offset directly - let the animation system handle it
-                return oldFocus;
+                return position;
             }
-        
-            Element* exitTableDown(Element* oldFocus) {
-                size_t currentTableIndex = tableIndex;
-                resetTableState();
-                m_focusedIndex = currentTableIndex;
+
+            // Enhanced scroll methods that ensure we always reach boundaries
+            inline bool canScrollDown() {
+                if (m_listHeight <= getHeight()) return false;
+                float maxOffset = static_cast<float>(m_listHeight - getHeight());
+                return (m_nextOffset < maxOffset - 0.1f) && (m_offset < maxOffset - 0.1f);
+            }
+            
+            inline bool canScrollUp() {
+                return (m_nextOffset > 0.1f) || (m_offset > 0.1f);
+            }
+            
+            
+            //u64 m_lastScrollNavigationTime = 0;
+            //bool m_isHoldingOnTable = false;
+
+            // Enhanced scroll methods that snap to exact boundaries
+            inline void scrollDown() {
+                //u64 currentTime = armTicksToNs(armGetSystemTick());
+                //if ((currentTime - m_lastScrollNavigationTime) < HOLD_THRESHOLD_NS) {
+                //    m_isHoldingOnTable = true;
+                //    m_isHolding=true;
+                //} else {
+                //    m_isHoldingOnTable = false;
+                //    m_stoppedAtBoundary = false;
+                //    m_hasWrappedInCurrentSequence = false;
+                //}
+            
+                float scrollStep = (m_isHolding) ? TABLE_SCROLL_STEP_SIZE : TABLE_SCROLL_STEP_SIZE_CLICK;
+                float maxOffset = static_cast<float>(m_listHeight - getHeight());
                 
-                // Look for next focusable item after current table
-                for (size_t i = currentTableIndex + 1; i < m_items.size(); ++i) {
-                    if (canEnterTable(i)) {
-                        return enterTable(oldFocus, i, true);
-                    } else if (canFocusRegularItem(i)) {
-                        m_focusedIndex = i;
-                        updateScrollOffset();
-                        return m_items[i]->requestFocus(oldFocus, FocusDirection::Down);
-                    }
+                m_nextOffset = std::min(m_nextOffset + scrollStep, maxOffset);
+                
+                // BOUNDARY SNAP: If we're very close to the bottom boundary, snap both positions exactly
+                if (m_nextOffset >= maxOffset - 2.0f) {
+                    m_nextOffset = maxOffset;
+                    m_offset = maxOffset;  // Also snap current position immediately
+                    m_scrollVelocity = 0.0f;
                 }
-                
-                return oldFocus;
             }
-        
-            Element* exitTableUp(Element* oldFocus) {
-                size_t currentTableIndex = tableIndex;
-                resetTableState();
-                m_focusedIndex = currentTableIndex;
+            
+            inline void scrollUp() {
+                //u64 currentTime = armTicksToNs(armGetSystemTick());
+                //if ((currentTime - m_lastScrollNavigationTime) < HOLD_THRESHOLD_NS) {
+                //    m_isHoldingOnTable = true;
+                //    m_isHolding=true;
+                //} else {
+                //    m_isHoldingOnTable = false;
+                //    m_stoppedAtBoundary = false;
+                //    m_hasWrappedInCurrentSequence = false;
+                //    m_lastScrollNavigationTime = 0;
+                //}
+            
+                float scrollStep = (m_isHolding) ? TABLE_SCROLL_STEP_SIZE : TABLE_SCROLL_STEP_SIZE_CLICK;
                 
-                // Look for previous focusable item before current table
-                for (ssize_t i = static_cast<ssize_t>(currentTableIndex) - 1; i >= 0; --i) {
-                    //ize_t idx = static_cast<size_t>(i);
-                    if (canEnterTable(i)) {
-                        return enterTable(oldFocus, i, false);
-                    } else if (canFocusRegularItem(i)) {
-                        m_focusedIndex = i;
-                        updateScrollOffset();
-                        return m_items[i]->requestFocus(oldFocus, FocusDirection::Up);
-                    }
+                m_nextOffset = std::max(m_nextOffset - scrollStep, 0.0f);
+                
+                // BOUNDARY SNAP: If we're very close to the top boundary, snap both positions exactly  
+                if (m_nextOffset <= 2.0f) {
+                    m_nextOffset = 0.0f;
+                    m_offset = 0.0f;  // Also snap current position immediately
+                    m_scrollVelocity = 0.0f;
                 }
-                
-                return oldFocus;
             }
-        
-            // Boundary detection
-            inline bool isAtAbsoluteTop() {
-                if (m_items.empty()) return true;
-                
-                if (isInTable) {
-                    // Must be at top of table AND no focusable items above
-                    bool atTableTop = (tableScrollOffset <= 1.0f); // Small epsilon
-                    return atTableTop && !hasFocusableItemsBefore(tableIndex);
-                }
-                
-                // Not in table - check if at very first focusable item
-                return !hasFocusableItemsBefore(m_focusedIndex);
-            }
-                                
-            inline bool isAtAbsoluteBottom() {
-                if (m_items.empty()) return true;
-                
-                if (isInTable) {
-                    // Must be at bottom of table AND no focusable items below
-                    if (tableIndex >= m_items.size()) return true;
-                    
-                    Element* table = m_items[tableIndex];
-                    float maxScroll = static_cast<float>(table->getHeight() - getHeight());
-                    
-                    // Use a small epsilon for floating point comparison
-                    bool atTableBottom = (tableScrollOffset >= maxScroll - 1.0f);
-                    return atTableBottom && !hasFocusableItemsAfter(tableIndex);
-                }
-                
-                // Not in table - check if at very last focusable item
-                return !hasFocusableItemsAfter(m_focusedIndex);
-            }
-                    
-            inline bool hasFocusableItemsBefore(size_t index) {
-                for (ssize_t i = static_cast<ssize_t>(index) - 1; i >= 0; --i) {
-                    //size_t idx = static_cast<size_t>(i);
-                    if (canFocusRegularItem(i) || canEnterTable(i)) {
-                        return true;
-                    }
-                }
-                return false;
-            }
-        
-            inline bool hasFocusableItemsAfter(size_t index) {
-                for (size_t i = index + 1; i < m_items.size(); ++i) {
-                    if (canFocusRegularItem(i) || canEnterTable(i)) {
-                        return true;
-                    }
-                }
-                return false;
-            }
-        
-            // Helper functions
-            inline bool canEnterTable(size_t index) {
-                if (index >= m_items.size() || !m_items[index]) return false;
-                return m_items[index]->isTable() && (m_items[index]->getHeight() > getHeight());
-            }
-        
-            inline bool canFocusRegularItem(size_t index) {
-                if (index >= m_items.size() || !m_items[index]) return false;
-                if (m_items[index]->isTable()) return false;
-                
-                // FIXED: More robust focus testing - try both directions
-                Element* testFocus = m_items[index]->requestFocus(nullptr, FocusDirection::None);
-                if (testFocus != nullptr) return true;
-                
-                // Try with directional focus as backup
-                testFocus = m_items[index]->requestFocus(nullptr, FocusDirection::Down);
-                return (testFocus != nullptr);
-            }
-        
-            // Wrapping
-            // Fix for the wrapToTop function
+            
             Element* wrapToTop(Element* oldFocus) {
-                resetTableState();
+                // Reset table scrolling when wrapping
+                isTableScrolling = false;
                 
+                // Variables pulled outside the loop for optimization
+                Element* newFocus;
+                
+                // Find first focusable item (including tables)
                 for (size_t i = 0; i < m_items.size(); ++i) {
-                    if (canFocusRegularItem(i)) {
+                    newFocus = m_items[i]->requestFocus(oldFocus, FocusDirection::Down);
+                    if (newFocus && newFocus != oldFocus) {
                         m_focusedIndex = i;
-                        Element* newFocus = m_items[i]->requestFocus(oldFocus, FocusDirection::Down);
-                        if (newFocus && newFocus != oldFocus) {
-                            // FIXED: Only set target offset, let animation system handle the smooth transition
-                            m_nextOffset = 0.0f;
-                            // Don't set m_offset - let updateScrollAnimation() handle the smooth transition
-                            return newFocus;
-                        }
-                    } else if (canEnterTable(i)) {
-                        return enterTable(oldFocus, i, true);
+                        m_nextOffset = 0.0f;
+                        return newFocus;
                     }
                 }
                 
-                return oldFocus;
-            }
-
-                        
-            // Also fix wrapToBottom for consistency
-            Element* wrapToBottom(Element* oldFocus) {
-                resetTableState();
+                // No focusable items - just scroll to top
+                m_nextOffset = 0.0f;
                 invalidate();
-                // REMOVED: m_justWrapped = true; // This was causing the issue
-                
-                //size_t idx;
-                // More thorough search for the last focusable item
-                for (ssize_t i = static_cast<ssize_t>(m_items.size()) - 1; i >= 0; --i) {
-                    //idx = static_cast<size_t>(i);
-                    if (canEnterTable(i)) {
-                        return enterTable(oldFocus, i, false);
-                    } else if (canFocusRegularItem(i)) {
-                        m_focusedIndex = i;
-                        Element* newFocus = m_items[i]->requestFocus(oldFocus, FocusDirection::Up);
-                        if (newFocus && newFocus != oldFocus) {
-                            // FIXED: Only set target offset for smooth animation to bottom
-                            if (m_listHeight > getHeight()) {
-                                
-                                m_nextOffset = static_cast<float>(m_listHeight - getHeight());
-                                // Don't set m_offset - let updateScrollAnimation() handle the smooth transition
-                            }
-                            return newFocus;
-                        }
-                    }
-                }
-                
                 return oldFocus;
             }
             
+            Element* wrapToBottom(Element* oldFocus) {
+                // Reset table scrolling when wrapping
+                isTableScrolling = false;
+                
+                invalidate();
+                
+                // Variables pulled outside the loop for optimization
+                Element* newFocus;
+                float maxOffset = (m_listHeight > getHeight()) ? static_cast<float>(m_listHeight - getHeight()) : 0.0f;
+                
+                // Find last focusable item (including tables)
+                for (ssize_t i = static_cast<ssize_t>(m_items.size()) - 1; i >= 0; --i) {
+                    newFocus = m_items[i]->requestFocus(oldFocus, FocusDirection::Up);
+                    if (newFocus && newFocus != oldFocus) {
+                        m_focusedIndex = static_cast<size_t>(i);
+                        if (m_listHeight > getHeight()) {
+                            m_nextOffset = maxOffset;
+                        }
+                        return newFocus;
+                    }
+                }
+                
+                // No focusable items - just scroll to bottom
+                if (m_listHeight > getHeight()) {
+                    m_nextOffset = maxOffset;
+                    invalidate();
+                }
+                return oldFocus;
+            }
             
             // Add these methods to handle jumps with smooth scrolling
+            Element* handleJumpToBottom(Element* oldFocus) {
+                if (m_items.empty()) return oldFocus;
+                
+                invalidate();
+                resetNavigationState();
+                jumpToBottom = false;  // Reset flag
+                
+                // Variables pulled outside the loop for optimization
+                Element* test;
+                float targetOffset = (m_listHeight > getHeight()) ? static_cast<float>(m_listHeight - getHeight()) : 0.0f;
+                const float tolerance = 5.0f;
+                
+                // Find the last focusable item
+                size_t lastFocusableIndex = m_items.size();
+                for (ssize_t i = static_cast<ssize_t>(m_items.size()) - 1; i >= 0; --i) {
+                    test = m_items[i]->requestFocus(nullptr, FocusDirection::None);
+                    if (test) {
+                        lastFocusableIndex = static_cast<size_t>(i);
+                        break;
+                    }
+                }
+                
+                // Check if we're already at the bottom with proper tolerance
+                bool alreadyAtBottom = false;
+                if (lastFocusableIndex < m_items.size()) {
+                    alreadyAtBottom = (m_focusedIndex == lastFocusableIndex) && 
+                                     (std::abs(m_nextOffset - targetOffset) <= tolerance);
+                }
+                
+                if (alreadyAtBottom) {
+                    return oldFocus;  // Already at bottom, do nothing
+                }
+                
+                // Not at bottom - perform the jump using SAME logic as wrapToBottom
+                if (lastFocusableIndex < m_items.size()) {
+                    m_focusedIndex = lastFocusableIndex;
+                    m_nextOffset = targetOffset;  // Use same calculation as wrapToBottom
+                    
+                    Element* newFocus = m_items[lastFocusableIndex]->requestFocus(oldFocus, FocusDirection::None);
+                    if (newFocus && newFocus != oldFocus) {
+                        return newFocus;
+                    }
+                }
+                
+                // No focusable items - just set target to bottom (same as wrapToBottom)
+                m_nextOffset = targetOffset;
+                return oldFocus;
+            }
+            
             Element* handleJumpToTop(Element* oldFocus) {
                 if (m_items.empty()) return oldFocus;
                 
-                // Check if already at the top-most focusable item
-                size_t firstFocusableIndex = SIZE_MAX;
+                invalidate();
+                resetNavigationState();
+                jumpToTop = false;  // Reset flag
+                
+                // Variables pulled outside the loop for optimization
+                Element* test;
+                float targetOffset = 0.0f;
+                const float tolerance = 5.0f;
+                
+                // Find the first focusable item
+                size_t firstFocusableIndex = m_items.size();  // Default to invalid
                 for (size_t i = 0; i < m_items.size(); ++i) {
-                    if (canFocusRegularItem(i) || canEnterTable(i)) {
+                    test = m_items[i]->requestFocus(nullptr, FocusDirection::None);
+                    if (test) {
                         firstFocusableIndex = i;
                         break;
                     }
                 }
                 
-                // If we're already at the first focusable item and not in a table, do nothing
-                if (firstFocusableIndex != SIZE_MAX && 
-                    m_focusedIndex == firstFocusableIndex && 
-                    !isInTable) {
-                    return oldFocus;
+                // Check if we're already at the top with proper tolerance
+                bool alreadyAtTop = false;
+                if (firstFocusableIndex < m_items.size()) {
+                    alreadyAtTop = (m_focusedIndex == firstFocusableIndex) && 
+                                  (std::abs(m_nextOffset - targetOffset) <= tolerance);
                 }
                 
-                // If we're in a table at the first position and already at top of table, do nothing
-                if (isInTable && tableIndex == firstFocusableIndex && tableScrollOffset <= 1.0f) {
-                    return oldFocus;
+                if (alreadyAtTop) {
+                    return oldFocus;  // Already at top, do nothing
                 }
                 
-                resetTableState();
-                resetNavigationState();
-                
-                // Find the first focusable item
-                for (size_t i = 0; i < m_items.size(); ++i) {
-                    if (canFocusRegularItem(i)) {
-                        m_focusedIndex = i;
-                        m_nextOffset = 0.0f; // Set target for smooth scroll to top
-                        // Don't set m_offset - let updateScrollAnimation() handle smooth transition
-                        Element* newFocus = m_items[i]->requestFocus(oldFocus, FocusDirection::None);
-                        if (newFocus && newFocus != oldFocus) {
-                            invalidate();
-                            return newFocus;
-                        }
-                    } else if (canEnterTable(i)) {
-                        m_nextOffset = 0.0f; // Set target for smooth scroll to top
-                        // Don't set m_offset - let updateScrollAnimation() handle smooth transition
-                        Element* newFocus = enterTable(oldFocus, i, true);
-                        invalidate();
-                        return newFocus ? newFocus : oldFocus;
+                // Not at top - perform the jump using SAME logic as wrapToTop
+                if (firstFocusableIndex < m_items.size()) {
+                    m_focusedIndex = firstFocusableIndex;
+                    m_nextOffset = targetOffset;  // Same as wrapToTop
+                    
+                    Element* newFocus = m_items[firstFocusableIndex]->requestFocus(oldFocus, FocusDirection::None);
+                    if (newFocus && newFocus != oldFocus) {
+                        return newFocus;
                     }
                 }
                 
+                // No focusable items - just set target to top (same as wrapToTop)
+                m_nextOffset = targetOffset;
                 return oldFocus;
             }
             
-            Element* handleJumpToBottom(Element* oldFocus) {
-                if (m_items.empty()) return oldFocus;
-                
-                // Check if already at the bottom-most focusable item
-                size_t lastFocusableIndex = SIZE_MAX;
-                //size_t idx;
-                for (ssize_t i = static_cast<ssize_t>(m_items.size()) - 1; i >= 0; --i) {
-                    //idx = static_cast<size_t>(i);
-                    if (canFocusRegularItem(i) || canEnterTable(i)) {
-                        lastFocusableIndex = i;
-                        break;
-                    }
-                }
-                
-                // If we're already at the last focusable item and not in a table, do nothing
-                if (lastFocusableIndex != SIZE_MAX && 
-                    m_focusedIndex == lastFocusableIndex && 
-                    !isInTable) {
-                    return oldFocus;
-                }
-                
-                float maxScroll;
-                // If we're in a table at the last position and already at bottom of table, do nothing
-                if (isInTable && tableIndex == lastFocusableIndex) {
-                    if (tableIndex < m_items.size()) {
-                        Element* table = m_items[tableIndex];
-                        maxScroll = static_cast<float>(table->getHeight() - getHeight());
-                        if (tableScrollOffset >= maxScroll - 1.0f) {
-                            return oldFocus;
-                        }
-                    }
-                }
-                
-                resetTableState();
-                resetNavigationState();
-                invalidate();
-                
-                // Find the last focusable item
-                for (ssize_t i = static_cast<ssize_t>(m_items.size()) - 1; i >= 0; --i) {
-                    //idx = static_cast<size_t>(i);
-                    if (canEnterTable(i)) {
-                        // Set target for smooth scroll to bottom position
-                        if (m_listHeight > getHeight()) {
-                            m_nextOffset = static_cast<float>(m_listHeight - getHeight());
-                        }
-                        // Don't set m_offset - let updateScrollAnimation() handle smooth transition
-                        Element* newFocus = enterTable(oldFocus, i, false);
-                        invalidate();
-                        return newFocus ? newFocus : oldFocus;
-                    } else if (canFocusRegularItem(i)) {
-                        m_focusedIndex = i;
-                        // Set target for smooth scroll to bottom position
-                        if (m_listHeight > getHeight()) {
-                            m_nextOffset = static_cast<float>(m_listHeight - getHeight());
-                        }
-                        // Don't set m_offset - let updateScrollAnimation() handle smooth transition
-                        Element* newFocus = m_items[i]->requestFocus(oldFocus, FocusDirection::None);
-                        if (newFocus && newFocus != oldFocus) {
-                            invalidate();
-                            return newFocus;
-                        }
-                    }
-                }
-                
-                return oldFocus;
-            }
-                        
-
                         
             inline void initializePrefixSums() {
                 prefixSums.clear();
@@ -6438,8 +5885,9 @@ namespace tsl {
                 }
             }
             
-            virtual inline void updateScrollOffset() {
-
+            
+            // Keep your EXACT original updateScrollOffset() method unchanged:
+            virtual void updateScrollOffset() {
                 if (Element::getInputMode() != InputMode::Controller) return;
                 
                 if (m_listHeight <= getHeight()) {
@@ -6447,24 +5895,36 @@ namespace tsl {
                     return;
                 }
                 
-                // If in table, don't override table scrolling
-                if (isInTable) return;
-                
-                if (prefixSums.size() != m_items.size() + 1) {
-                    initializePrefixSums();
+                // Calculate position of focused item
+                float itemPos = 0.0f;
+                for (size_t i = 0; i < m_focusedIndex && i < m_items.size(); ++i) {
+                    itemPos += m_items[i]->getHeight();
                 }
                 
-                // FIXED: If focused on first item, keep at absolute top
-                if (m_focusedIndex == 0) {
-                    m_nextOffset = 0.0f;
-                    return;
-                }
+                // Get the focused item's height
+                float itemHeight = (m_focusedIndex < m_items.size()) ? m_items[m_focusedIndex]->getHeight() : 0.0f;
                 
-                m_nextOffset = std::clamp(prefixSums[m_focusedIndex] - (getHeight() / 3), 
-                                        0.0f, 
-                                        static_cast<float>(m_listHeight - getHeight()));
+                // Calculate viewport height
+                float viewHeight = static_cast<float>(getHeight());
+                
+                // CHANGED: Calculate the actual center position of the item
+                float itemCenterPos = itemPos + (itemHeight);
+                
+                // CHANGED: Calculate offset to put item center at viewport center
+                float viewportCenter = viewHeight / 2.0f;
+                float idealOffset = itemCenterPos - viewportCenter;
+                
+                // Clamp to valid scroll bounds
+                idealOffset = std::max(0.0f, std::min(idealOffset, static_cast<float>(m_listHeight - getHeight())));
+                
+                // Set target for smooth animation
+                m_nextOffset = idealOffset;
             }
+            
         };
+
+
+        // Forward declare external method to be used in changeTo
 
         /**
          * @brief A item that goes into a list
@@ -6520,14 +5980,19 @@ namespace tsl {
                 }
                 renderer->drawRect(this->getX() + 4, bottomBound, this->getWidth() + 10, 1, a(separatorColor));
                 lastBottomBound = bottomBound;
-        
+            
+            #if IS_LAUNCHER_DIRECTIVE
+                static const std::vector<std::string> specialChars = {ult::STAR_SYMBOL};
+            #else
+                static const std::vector<std::string> specialChars = {};
+            #endif
                 // Fast path for non-truncated text
                 if (!m_truncated) [[likely]] {
-                    renderer->drawStringWithColoredSections(m_text, {ult::STAR_SYMBOL}, this->getX() + 19, this->getY() + 45 - yOffset, 23,
+                    renderer->drawStringWithColoredSections(m_text, false, specialChars, this->getX() + 19, this->getY() + 45 - yOffset, 23,
                         a(m_focused ? (useClickTextColor ? clickTextColor : selectedTextColor) : (useClickTextColor ? clickTextColor : defaultTextColor)),
                         a(m_focused ? starColor : selectionStarColor));
                 } else {
-                    drawTruncatedText(renderer, yOffset, useClickTextColor, {ult::STAR_SYMBOL});
+                    drawTruncatedText(renderer, yOffset, useClickTextColor, specialChars);
                 }
         
                 if (!m_value.empty()) [[likely]] {
@@ -6616,9 +6081,9 @@ namespace tsl {
                 return m_value;
             }
 
-            virtual bool matchesJumpCriteria(const std::string& jumpText, const std::string& jumpValue) const override {
-                return matchesJumpCriteria(jumpText, jumpValue, true); // Default to exact match
-            }
+            //virtual bool matchesJumpCriteria(const std::string& jumpText, const std::string& jumpValue) const override {
+            //    return matchesJumpCriteria(jumpText, jumpValue, true); // Default to exact match
+            //}
 
             virtual bool matchesJumpCriteria(const std::string& jumpText, const std::string& jumpValue, bool exactMatch=true) const {
                 if (jumpText.empty() && jumpValue.empty()) return false;
@@ -6669,17 +6134,22 @@ namespace tsl {
             }
         
             void calculateWidths(gfx::Renderer* renderer) {
-                m_maxWidth = m_value.empty() ? 
-                    getWidth() - 62 : 
-                    getWidth() - tsl::gfx::calculateStringWidth(m_value, 20) - 66;
-        
-                const u32 width = tsl::gfx::calculateStringWidth(m_text, 23);
+                if (m_value.empty()) {
+                    m_maxWidth = getWidth() - 62;
+                } else {
+                    auto [valueWidth, valueHeight] = renderer->getTextDimensions(m_value, false, 20);
+                    m_maxWidth = getWidth() - valueWidth - 66;
+                }
+            
+                auto [textWidth, textHeight] = renderer->getTextDimensions(m_text, false, 23);
+                const u32 width = textWidth;
                 m_truncated = width > m_maxWidth + 20;
-        
+            
                 if (m_truncated) [[unlikely]] {
                     m_scrollText.reserve(m_text.size() * 2 + 8); // Pre-allocate
                     m_scrollText = m_text + "        ";
-                    m_textWidth = tsl::gfx::calculateStringWidth(m_scrollText, 23);
+                    auto [scrollWidth, scrollHeight] = renderer->getTextDimensions(m_scrollText, false, 23);
+                    m_textWidth = scrollWidth;
                     m_scrollText += m_text;
                     m_ellipsisText = renderer->limitStringLength(m_text, false, 23, m_maxWidth);
                 } else {
@@ -6691,12 +6161,12 @@ namespace tsl {
                 if (m_focused) [[likely]] {
                     renderer->enableScissoring(getX() + 6, 97, m_maxWidth + (m_value.empty() ? 49 : 27), tsl::cfg::FramebufferHeight - 170);
                     //renderer->drawString(m_scrollText, false, getX() + 19 - static_cast<s32>(m_scrollOffset), getY() + 45 - yOffset, 23, a(selectedTextColor));
-                    renderer->drawStringWithColoredSections(m_scrollText, specialSymbols, getX() + 19 - static_cast<s32>(m_scrollOffset), getY() + 45 - yOffset, 23,
-                        a(useClickTextColor ? clickTextColor : defaultTextColor), a(starColor));
+                    renderer->drawStringWithColoredSections(m_scrollText, false, specialSymbols, getX() + 19 - static_cast<s32>(m_scrollOffset), getY() + 45 - yOffset, 23,
+                        a(useClickTextColor ? clickTextColor : selectedTextColor), a(starColor));
                     renderer->disableScissoring();
                     handleScrolling();
                 } else {
-                    renderer->drawStringWithColoredSections(m_ellipsisText, specialSymbols, getX() + 19, getY() + 45 - yOffset, 23,
+                    renderer->drawStringWithColoredSections(m_ellipsisText, false, specialSymbols, getX() + 19, getY() + 45 - yOffset, 23,
                         a(useClickTextColor ? clickTextColor : defaultTextColor), a(starColor));
                 }
             }
@@ -6786,7 +6256,6 @@ namespace tsl {
             }
         };
         
-        
         class MiniListItem : public ListItem {
         public:
             // Constructor for MiniListItem, with no `isMini` boolean.
@@ -6819,7 +6288,7 @@ namespace tsl {
             }
             virtual ~ListItemV2() {}
         
-        
+                    
             virtual void draw(gfx::Renderer *renderer) override {
                 static float lastBottomBound;
                 bool useClickTextColor = false;
@@ -6831,27 +6300,30 @@ namespace tsl {
                     }
                     //renderer->drawRect(ELEMENT_BOUNDS(this), tsl::style::color::ColorClickAnimation);
                 }
-        
+            
                 // Calculate vertical offset to center the text
                 s32 yOffset = (tsl::style::ListItemDefaultHeight - this->m_listItemHeight) / 2;
-        
+            
                 if (this->m_maxWidth == 0) {
                     if (this->m_value.length() > 0) {
                         //std::tie(width, height) = renderer->drawString(this->m_value, false, 0, 0, 20, a(tsl::style::color::ColorTransparent));
-                        width = tsl::gfx::calculateStringWidth(this->m_value, 20);
+                        auto [valueWidth, valueHeight] = renderer->getTextDimensions(this->m_value, false, 20);
+                        width = valueWidth;
                         this->m_maxWidth = this->getWidth() - width - 70 +4;
                     } else {
                         this->m_maxWidth = this->getWidth() - 40 -10 -12;
                     }
                     
                     //std::tie(width, height) = renderer->drawString(this->m_text, false, 0, 0, 23, a(tsl::style::color::ColorTransparent));
-                    width = tsl::gfx::calculateStringWidth(this->m_text, 23);
+                    auto [textWidth, textHeight] = renderer->getTextDimensions(this->m_text, false, 23);
+                    width = textWidth;
                     this->m_trunctuated = width > this->m_maxWidth+20;
                     
                     if (this->m_trunctuated) {
                         this->m_scrollText = this->m_text + "        ";
                         //std::tie(width, height) = renderer->drawString(this->m_scrollText, false, 0, 0, 23, a(tsl::style::color::ColorTransparent));
-                        width = tsl::gfx::calculateStringWidth(this->m_scrollText, 23);
+                        auto [scrollWidth, scrollHeight] = renderer->getTextDimensions(this->m_scrollText, false, 23);
+                        width = scrollWidth;
                         this->m_scrollText += this->m_text;
                         this->m_textWidth = width;
                         
@@ -6864,10 +6336,10 @@ namespace tsl {
                 if (lastBottomBound !=  this->getTopBound())
                     renderer->drawRect(this->getX()+4, this->getTopBound(), this->getWidth()+6 +4, 1, a(separatorColor));
                 renderer->drawRect(this->getX()+4, this->getBottomBound(), this->getWidth()+6 +4, 1, a(separatorColor));
-        
+            
                 lastBottomBound = this->getBottomBound();
                 
-        
+            
                 if (this->m_trunctuated) {
                     if (this->m_focused) {
                         if (this->m_value.length() > 0)
@@ -6898,7 +6370,12 @@ namespace tsl {
                     }
                 } else {
                     // Render the text with special character handling
-                    renderer->drawStringWithColoredSections(this->m_text, {ult::STAR_SYMBOL+"  "}, this->getX() + 20-1, this->getY() + 45 - yOffset, 23,
+                #if IS_LAUNCHER_DIRECTIVE
+                    static const std::vector<std::string> specialChars = {ult::STAR_SYMBOL};
+                #else
+                    static const std::vector<std::string> specialChars = {};
+                #endif
+                    renderer->drawStringWithColoredSections(this->m_text, false, specialChars, this->getX() + 20-1, this->getY() + 45 - yOffset, 23,
                         a(this->m_focused ? (!useClickTextColor ? selectedTextColor : clickTextColor) : (!useClickTextColor ? defaultTextColor : clickTextColor)),
                         a(this->m_focused ? starColor : selectionStarColor)
                     );
@@ -6912,14 +6389,14 @@ namespace tsl {
                 const s32 fontSize = 20;
                 //bool isFaint = ;
                 //bool isFocused = this->m_focused;
-        
-        
+            
+            
                 //static bool lastRunningInterpreter = ult::runningInterpreter.load(std::memory_order_acquire);
-        
+            
                 // Determine text color
                 auto textColor = this->m_faint ? a(m_faintColor) : a(m_valueColor);
                 
-        
+            
                 if (this->m_value != ult::INPROGRESS_SYMBOL) {
                     // Draw the string with the determined text color
                     renderer->drawString(this->m_value, false, xPosition, yPosition, fontSize, textColor);
@@ -6929,12 +6406,12 @@ namespace tsl {
                     static size_t throbberCounter = 0;
                     // Avoid copying the original string
                     const std::string* stringPtr = &this->m_value;
-        
+            
                     //size_t index = (throbberCounter / 10) % ult::THROBBER_SYMBOLS.size();  // Change index every 10 counts
                     stringPtr = &ult::THROBBER_SYMBOLS[(throbberCounter / 10) % ult::THROBBER_SYMBOLS.size()];  // Point to the new string without copying
                     
                     throbberCounter++;
-        
+            
                     // Reset counter to prevent overflow after many cycles (ensures it never grows indefinitely)
                     if (throbberCounter >= 10 * ult::THROBBER_SYMBOLS.size()) {
                         throbberCounter = 0;
@@ -7240,7 +6717,7 @@ namespace tsl {
                 ult::applyLangReplacements(m_text);
                 ult::convertComboToUnicode(m_text);
                 m_isItem = false;
-                m_isTable = true;
+                //m_isTable = true;
             }
             virtual ~CategoryHeader() {}
             
@@ -7705,15 +7182,11 @@ namespace tsl {
                     baseX += iconOffset;
                     trackBarWidth -= iconOffset;
                 }
-
-
-
                 // Calculate the spacing between each step
                 float stepSpacing = static_cast<float>(trackBarWidth) / (this->m_numSteps - 1);
                 
                 // Calculate the halfway point index
                 u8 halfNumSteps = (this->m_numSteps - 1) / 2;
-
                 // Draw step rectangles
                 u16 stepX;
                 for (u8 i = 0; i < this->m_numSteps; i++) {
@@ -7723,7 +7196,6 @@ namespace tsl {
                     if (i > halfNumSteps) {
                         stepX -= 1;
                     }
-
                     // Adjust the last step to avoid overshooting
                     if (i == this->m_numSteps - 1) {
                         stepX = baseX + trackBarWidth -1;
@@ -7733,30 +7205,11 @@ namespace tsl {
                 }
                 
                 u8 currentDescIndex = std::clamp(this->m_value / (100 / (this->m_numSteps - 1)), 0, this->m_numSteps - 1);
-
-                auto descWidth = tsl::gfx::calculateStringWidth(this->m_stepDescriptions[currentDescIndex].c_str(), 15);
+                auto [descWidth, descHeight] = renderer->getTextDimensions(this->m_stepDescriptions[currentDescIndex].c_str(), false, 15);
                 renderer->drawString(this->m_stepDescriptions[currentDescIndex].c_str(), false, ((baseX +1) + (trackBarWidth) / 2) - (descWidth / 2), this->getY() + 20 + 6, 15, a(tsl::style::color::ColorDescription));
                 
                 // Draw the parent trackbar
                 StepTrackBar::draw(renderer);
-
-
-
-
-
-                //u16 trackBarWidth = this->getWidth() - 95;
-                //u16 stepWidth = trackBarWidth / (this->m_numSteps - 1);
-                //
-                //for (u8 i = 0; i < this->m_numSteps; i++) {
-                //    renderer->drawRect(this->getX() + 60 + stepWidth * i, this->getY() + 50, 1, 10, a(tsl::style::color::ColorFrame));
-                //}
-                //
-                //u8 currentDescIndex = std::clamp(this->m_value / (100 / (this->m_numSteps - 1)), 0, this->m_numSteps - 1);
-                //
-                //auto [descWidth, descHeight] = renderer->drawString(this->m_stepDescriptions[currentDescIndex].c_str(), false, 0, 0, 15, tsl::style::color::ColorTransparent);
-                //renderer->drawString(this->m_stepDescriptions[currentDescIndex].c_str(), false, ((this->getX() + 60) + (this->getWidth() - 95) / 2) - (descWidth / 2), this->getY() + 20, 15, a(tsl::style::color::ColorDescription));
-                //
-                //StepTrackBar::draw(renderer);
             }
 
         protected:
@@ -7851,6 +7304,12 @@ namespace tsl {
                 }
                 bool success = false;
         
+                // Placeholder replacement
+                static const std::string valuePlaceholder = "{value}";
+                static const std::string indexPlaceholder = "{index}";
+                static const size_t valuePlaceholderLength = valuePlaceholder.length();
+                static const size_t indexPlaceholderLength = indexPlaceholder.length();
+
                 size_t pos;
                 size_t tryCount = 0;
                 while (!success) {
@@ -7859,11 +7318,6 @@ namespace tsl {
                             break;
                         auto modifiedCmds = getSourceReplacement(commands, valueStr, m_index, m_packagePath);
                         
-                        // Placeholder replacement
-                        const std::string valuePlaceholder = "{value}";
-                        const std::string indexPlaceholder = "{index}";
-                        const size_t valuePlaceholderLength = valuePlaceholder.length();
-                        const size_t indexPlaceholderLength = indexPlaceholder.length();
                         
                         
                         for (auto& cmd : modifiedCmds) {
@@ -8102,8 +7556,8 @@ namespace tsl {
                 s32 xPos = this->getX() + 59;
                 s32 yPos = this->getY() + 40 + 16 - 1;
                 s32 width = this->getWidth() - 95;
-        
-        
+            
+            
                 // Draw track bar background
                 drawBar(renderer, xPos, yPos-3, width, trackBarEmptyColor, !m_usingNamedStepTrackbar);
                 
@@ -8122,25 +7576,25 @@ namespace tsl {
                  
                 std::string labelPart = this->m_label;
                 ult::removeTag(labelPart);
-        
+            
                 std::string valuePart;
                 if (!m_usingNamedStepTrackbar)
                     valuePart = (this->m_units == "%" || this->m_units == "°C" || this->m_units == "°F") ? ult::to_string(this->m_value) + this->m_units : ult::to_string(this->m_value) + (this->m_units.empty() ? "" : " ") + this->m_units;
                 else
                     valuePart = this->m_selection;
-        
-                size_t valueWidth = tsl::gfx::calculateStringWidth(valuePart, 16);
-        
+            
+                auto [valueWidth, valueHeight] = renderer->getTextDimensions(valuePart, false, 16);
+            
                 renderer->drawString(labelPart, false, xPos, this->getY() + 14 + 16, 16, (!this->m_focused ? a(defaultTextColor) : a(selectedTextColor)));
                 renderer->drawString(valuePart, false, this->getWidth() -17 - valueWidth, this->getY() + 14 + 16, 16, a(onTextColor));
-        
-        
+            
+            
                 if (lastBottomBound != this->getTopBound())
                     renderer->drawRect(this->getX() + 4+20-1, this->getTopBound(), this->getWidth() + 6 + 10+20 +4, 1, a(separatorColor));
                 renderer->drawRect(this->getX() + 4+20-1, this->getBottomBound(), this->getWidth() + 6 + 10+20 +4, 1, a(separatorColor));
                 lastBottomBound = this->getBottomBound();
             }
-        
+                    
             
             virtual void layout(u16 parentX, u16 parentY, u16 parentWidth, u16 parentHeight) override {
                 this->setBoundaries(this->getX() - 16 , this->getY(), this->getWidth()+20+4, tsl::style::TrackBarDefaultHeight );
@@ -8884,6 +8338,12 @@ namespace tsl {
         constexpr inline std::unique_ptr<T> initially(Args&&... args) {
             return std::make_unique<T>(args...);
         }
+
+        // Template version with clearGlyphCache as the last parameter
+        template<typename G, typename ...Args>
+        std::unique_ptr<tsl::Gui>& changeToWithCacheClear(Args&&... args) {
+            return this->changeTo(std::make_unique<G>(std::forward<Args>(args)...), true);
+        }
         
     private:
         using GuiPtr = std::unique_ptr<tsl::Gui>;
@@ -9009,9 +8469,13 @@ namespace tsl {
             renderer.endFrame();
         }
         
+        // Calculate transition using ease-in-out curve instead of linear
+        float easeInOutCubic(float t) {
+            return t < 0.5f ? 4.0f * t * t * t : 1.0f - pow(-2.0f * t + 2.0f, 3.0f) / 2.0f;
+        }
+                        
 
-
-                
+                        
         void handleInput(u64 keysDown, u64 keysHeld, bool touchDetected, const HidTouchState &touchPos, HidAnalogStickState joyStickPosLeft, HidAnalogStickState joyStickPosRight) {
             // Static variables to maintain state between function calls
             static HidTouchState initialTouchPos = { 0 };
@@ -9026,7 +8490,7 @@ namespace tsl {
             
             static bool hasScrolled = false;
             static void* lastGuiPtr = nullptr;  // Use void* instead
-
+        
             auto& currentGui = this->getCurrentGui();
             //static bool isTopElement = true;
         
@@ -9081,7 +8545,7 @@ namespace tsl {
                 }
             }
         #endif
-
+        
             // Reset touch state when GUI changes
             if (currentGui.get() != lastGuiPtr) {  // or just currentGui != lastGuiPtr if it's not a smart pointer
                 hasScrolled = false;
@@ -9091,7 +8555,7 @@ namespace tsl {
                 initialTouchPos = { 0 };
                 lastGuiPtr = currentGui.get();  // or just currentGui
             }
-                    
+            
             if (!currentFocus && !ult::simulatedBack && ult::simulatedBackComplete && !ult::stillTouching && !oldTouchDetected && !ult::runningInterpreter.load(std::memory_order_acquire)) {
                 if (!topElement) return;
                 
@@ -9180,17 +8644,30 @@ namespace tsl {
                         if (!singlePressHandled && durationSincePress_ns >= clickThreshold_ns) {
                             singlePressHandled = true;
                         }
+                        
+                        if (!tsl::elm::isTableScrolling) {
+                            // Calculate transition factor (t) from 0 to 1 based on how far we are from the transition point
+                            static const u64 transitionPoint_ns = 2000000000ULL; // 2000ms in nanoseconds
+                            static const u64 initialInterval_ns = 67000000ULL;   // 67ms in nanoseconds
+                            static const u64 shortInterval_ns = 10000000ULL;     // 10ms in nanoseconds
+                            
+                            float t = (durationSincePress_ns >= transitionPoint_ns) ? 1.0f : 
+                                     (float)durationSincePress_ns / (float)transitionPoint_ns;
+                            // Smooth transition between intervals using linear interpolation
+                            keyEventInterval_ns = ((1.0f - t) * initialInterval_ns + t * shortInterval_ns);
+                        } else {
+                            // Table scrolling - faster timing
+                            static const u64 transitionPoint_ns = 300000000ULL; // 300ms (faster transition)
+                            static const u64 initialInterval_ns = 33000000ULL;   // 33ms (faster initial)
+                            static const u64 shortInterval_ns = 5000000ULL;      // 5ms (faster sustained)
+                            
+                            float t = (durationSincePress_ns >= transitionPoint_ns) ? 1.0f : 
+                                     (float)durationSincePress_ns / (float)transitionPoint_ns;
+                            // Smooth transition between intervals using linear interpolation
+                            keyEventInterval_ns = ((1.0f - t) * initialInterval_ns + t * shortInterval_ns);
+                        }
+                        
         
-                        // Calculate transition factor (t) from 0 to 1 based on how far we are from the transition point
-                        static const u64 transitionPoint_ns = 2000000000ULL; // 2000ms in nanoseconds
-                        static const u64 initialInterval_ns = 67000000ULL;   // 67ms in nanoseconds
-                        static const u64 shortInterval_ns = 10000000ULL;     // 10ms in nanoseconds
-                        
-                        float t = (durationSincePress_ns >= transitionPoint_ns) ? 1.0f : 
-                                 (float)durationSincePress_ns / (float)transitionPoint_ns;
-                        
-                        // Smooth transition between intervals using linear interpolation
-                        keyEventInterval_ns = (u64)((1.0f - t) * initialInterval_ns + t * shortInterval_ns);
                         
                         if (singlePressHandled && durationSinceLastEvent_ns >= keyEventInterval_ns) {
                             lastKeyEventTime_ns = currentTime_ns;
@@ -9234,14 +8711,30 @@ namespace tsl {
                 topElement->onTouch(elm::TouchEvent::Release, oldTouchPos.x, oldTouchPos.y, oldTouchPos.x, oldTouchPos.y, initialTouchPos.x, initialTouchPos.y);
             }
         
+            // Cache common calculations
+            const float backLeftEdge = 20.0f + ult::layerEdge;
+            const float backRightEdge = ult::backWidth + 86.0f + ult::layerEdge;
+            const float selectRightEdge = backRightEdge + ult::selectWidth + 68.0f;
+            const float menuRightEdge = 245.0f + ult::layerEdge;
+            const u32 footerY = cfg::FramebufferHeight - 73U;
+            
             // Touch region calculations
-            ult::touchingBack = (touchPos.x >= 20.0f + ult::layerEdge && touchPos.x < ult::backWidth+86.0f + ult::layerEdge && touchPos.y > cfg::FramebufferHeight - 73U) && (initialTouchPos.x >= 20.0f + ult::layerEdge && initialTouchPos.x < ult::backWidth+86.0f + ult::layerEdge && initialTouchPos.y > cfg::FramebufferHeight - 73U);
-            ult::touchingSelect = !ult::noClickableItems && (touchPos.x >= ult::backWidth+86.0f + ult::layerEdge && touchPos.x < (ult::backWidth+86.0f + ult::selectWidth+68.0f + ult::layerEdge) && touchPos.y > cfg::FramebufferHeight - 73U) && (initialTouchPos.x >=  ult::backWidth+86.0f + ult::layerEdge && initialTouchPos.x < (ult::backWidth+86.0f + ult::selectWidth+68.0f + ult::layerEdge) && initialTouchPos.y > cfg::FramebufferHeight - 73U);
+            ult::touchingBack = (touchPos.x >= backLeftEdge && touchPos.x < backRightEdge && touchPos.y > footerY) && 
+                                (initialTouchPos.x >= backLeftEdge && initialTouchPos.x < backRightEdge && initialTouchPos.y > footerY);
+            
+            ult::touchingSelect = !ult::noClickableItems && 
+                                  (touchPos.x >= backRightEdge && touchPos.x < selectRightEdge && touchPos.y > footerY) && 
+                                  (initialTouchPos.x >= backRightEdge && initialTouchPos.x < selectRightEdge && initialTouchPos.y > footerY);
+            
             if (!ult::noClickableItems)
-                ult::touchingNextPage = (touchPos.x >= (ult::backWidth+86.0f + ult::selectWidth+68.0f + ult::layerEdge) && (touchPos.x <= ult::backWidth+86.0f + ult::selectWidth+68.0f +ult::nextPageWidth+70.0f + ult::layerEdge) && touchPos.y > cfg::FramebufferHeight - 73U) && (initialTouchPos.x >= (ult::backWidth+86.0f + ult::selectWidth+68.0f + ult::layerEdge) && (initialTouchPos.x <= ult::backWidth+86.0f + ult::selectWidth+68.0f +ult::nextPageWidth+70.0f + ult::layerEdge) && initialTouchPos.y > cfg::FramebufferHeight - 73U);
+                ult::touchingNextPage = (touchPos.x >= selectRightEdge && (touchPos.x <= selectRightEdge + ult::nextPageWidth + 70.0f) && touchPos.y > footerY) && 
+                                        (initialTouchPos.x >= selectRightEdge && (initialTouchPos.x <= selectRightEdge + ult::nextPageWidth + 70.0f) && initialTouchPos.y > footerY);
             else
-                ult::touchingNextPage = (touchPos.x >= (ult::backWidth+86.0f + ult::layerEdge) && (touchPos.x <= ult::backWidth+86.0f +ult::nextPageWidth+70.0f + ult::layerEdge) && touchPos.y > cfg::FramebufferHeight - 73U) && (initialTouchPos.x >= (ult::backWidth+86.0f + ult::layerEdge) && (initialTouchPos.x <= ult::backWidth+86.0f +ult::nextPageWidth+70.0f + ult::layerEdge) && initialTouchPos.y > cfg::FramebufferHeight - 73U);
-            ult::touchingMenu = (touchPos.x > ult::layerEdge && touchPos.x <= 245+ult::layerEdge && touchPos.y > 10U && touchPos.y <= 83U) && (initialTouchPos.x > ult::layerEdge && initialTouchPos.x <= 245 + ult::layerEdge && initialTouchPos.y > 10U && initialTouchPos.y <= 83U);
+                ult::touchingNextPage = (touchPos.x >= backRightEdge && (touchPos.x <= backRightEdge + ult::nextPageWidth + 70.0f) && touchPos.y > footerY) && 
+                                        (initialTouchPos.x >= backRightEdge && (initialTouchPos.x <= backRightEdge + ult::nextPageWidth + 70.0f) && initialTouchPos.y > footerY);
+            
+            ult::touchingMenu = (touchPos.x > ult::layerEdge && touchPos.x <= menuRightEdge && touchPos.y > 10U && touchPos.y <= 83U) && 
+                                (initialTouchPos.x > ult::layerEdge && initialTouchPos.x <= menuRightEdge && initialTouchPos.y > 10U && initialTouchPos.y <= 83U);
             
         
             if (touchDetected) {
@@ -9264,7 +8757,9 @@ namespace tsl {
                     initialTouchPos = touchPos;
                     elm::Element::setInputMode(InputMode::Touch);
                     if (!ult::runningInterpreter.load(std::memory_order_acquire)) {
-                        ult::touchInBounds = (initialTouchPos.y <= cfg::FramebufferHeight - 73U && initialTouchPos.y > 73U && initialTouchPos.x <= ult::layerEdge + cfg::FramebufferWidth-30U && initialTouchPos.x > 40U + ult::layerEdge);
+                        ult::touchInBounds = (initialTouchPos.y <= footerY && initialTouchPos.y > 73U && 
+                                            initialTouchPos.x <= ult::layerEdge + cfg::FramebufferWidth - 30U && 
+                                            initialTouchPos.x > 40U + ult::layerEdge);
                         if (ult::touchInBounds) currentGui->removeFocus();
                     }
                     touchEvent = elm::TouchEvent::Touch;
@@ -9272,7 +8767,8 @@ namespace tsl {
                 
                 if (currentGui && topElement && !ult::runningInterpreter.load(std::memory_order_acquire)) {
                     topElement->onTouch(touchEvent, touchPos.x, touchPos.y, oldTouchPos.x, oldTouchPos.y, initialTouchPos.x, initialTouchPos.y);
-                    if (touchPos.x > 40U + ult::layerEdge && touchPos.x <= cfg::FramebufferWidth-30U + ult::layerEdge && touchPos.y > 73U && touchPos.y <= cfg::FramebufferHeight - 73U) {
+                    if (touchPos.x > 40U + ult::layerEdge && touchPos.x <= cfg::FramebufferWidth - 30U + ult::layerEdge && 
+                        touchPos.y > 73U && touchPos.y <= footerY) {
                         currentGui->removeFocus();
                     }
                 }
@@ -9292,19 +8788,24 @@ namespace tsl {
                 ult::stillTouching = true;
             } else {
                 if (!ult::interruptedTouch && !ult::runningInterpreter.load(std::memory_order_acquire)) {
-                    if ((oldTouchPos.x >= 20.0f + ult::layerEdge && oldTouchPos.x < ult::backWidth+86.0f + ult::layerEdge && oldTouchPos.y > cfg::FramebufferHeight - 73U) && (initialTouchPos.x >= 20.0f + ult::layerEdge && initialTouchPos.x < ult::backWidth+86.0f + ult::layerEdge && initialTouchPos.y > cfg::FramebufferHeight - 73U)) {
+                    if ((oldTouchPos.x >= backLeftEdge && oldTouchPos.x < backRightEdge && oldTouchPos.y > footerY) && 
+                        (initialTouchPos.x >= backLeftEdge && initialTouchPos.x < backRightEdge && initialTouchPos.y > footerY)) {
                         ult::simulatedBackComplete = false;
                         ult::simulatedBack = true;
-                    } else if (!ult::noClickableItems && (oldTouchPos.x >= ult::backWidth+86.0f + ult::layerEdge && oldTouchPos.x < (ult::backWidth+86.0f + ult::selectWidth+68.0f + ult::layerEdge) && oldTouchPos.y > cfg::FramebufferHeight - 73U) && (initialTouchPos.x >=  ult::backWidth+86.0f + ult::layerEdge && initialTouchPos.x < (ult::backWidth+86.0f + ult::selectWidth+68.0f + ult::layerEdge) && initialTouchPos.y > cfg::FramebufferHeight - 73U)) {
+                    } else if (!ult::noClickableItems && (oldTouchPos.x >= backRightEdge && oldTouchPos.x < selectRightEdge && oldTouchPos.y > footerY) && 
+                               (initialTouchPos.x >= backRightEdge && initialTouchPos.x < selectRightEdge && initialTouchPos.y > footerY)) {
                         ult::simulatedSelectComplete = false;
                         ult::simulatedSelect = true;
-                    } else if (!ult::noClickableItems && (oldTouchPos.x >= (ult::backWidth+86.0f + ult::selectWidth+68.0f + ult::layerEdge) && (oldTouchPos.x <= ult::backWidth+86.0f + ult::selectWidth+68.0f +ult::nextPageWidth+70.0f + ult::layerEdge) && oldTouchPos.y > cfg::FramebufferHeight - 73U) && (initialTouchPos.x >= (ult::backWidth+86.0f + ult::selectWidth+68.0f + ult::layerEdge) && (initialTouchPos.x <= ult::backWidth+86.0f + ult::selectWidth+68.0f +ult::nextPageWidth+70.0f + ult::layerEdge) && initialTouchPos.y > cfg::FramebufferHeight - 73U)) {
+                    } else if (!ult::noClickableItems && (oldTouchPos.x >= selectRightEdge && (oldTouchPos.x <= selectRightEdge + ult::nextPageWidth + 70.0f) && oldTouchPos.y > footerY) && 
+                               (initialTouchPos.x >= selectRightEdge && (initialTouchPos.x <= selectRightEdge + ult::nextPageWidth + 70.0f) && initialTouchPos.y > footerY)) {
                         ult::simulatedNextPageComplete = false;
                         ult::simulatedNextPage = true;
-                    } else if (ult::noClickableItems && (oldTouchPos.x >= (ult::backWidth+86.0f + ult::layerEdge) && (oldTouchPos.x <= ult::backWidth+86.0f +ult::nextPageWidth+70.0f + ult::layerEdge) && oldTouchPos.y > cfg::FramebufferHeight - 73U) && (initialTouchPos.x >= (ult::backWidth+86.0f + ult::layerEdge) && (initialTouchPos.x <= ult::backWidth+86.0f +ult::nextPageWidth+70.0f + ult::layerEdge) && initialTouchPos.y > cfg::FramebufferHeight - 73U)) {
+                    } else if (ult::noClickableItems && (oldTouchPos.x >= backRightEdge && (oldTouchPos.x <= backRightEdge + ult::nextPageWidth + 70.0f) && oldTouchPos.y > footerY) && 
+                               (initialTouchPos.x >= backRightEdge && (initialTouchPos.x <= backRightEdge + ult::nextPageWidth + 70.0f) && initialTouchPos.y > footerY)) {
                         ult::simulatedNextPageComplete = false;
                         ult::simulatedNextPage = true;
-                    } else if ((oldTouchPos.x > ult::layerEdge && oldTouchPos.x <= ult::layerEdge + 245 && oldTouchPos.y > 10U && oldTouchPos.y <= 83U) && (initialTouchPos.x > ult::layerEdge && initialTouchPos.x <= ult::layerEdge + 245 && initialTouchPos.y > 10U && initialTouchPos.y <= 83U)) {
+                    } else if ((oldTouchPos.x > ult::layerEdge && oldTouchPos.x <= menuRightEdge && oldTouchPos.y > 10U && oldTouchPos.y <= 83U) && 
+                               (initialTouchPos.x > ult::layerEdge && initialTouchPos.x <= menuRightEdge && initialTouchPos.y > 10U && initialTouchPos.y <= 83U)) {
                         ult::simulatedMenuComplete = false;
                         ult::simulatedMenu = true;
                     }
@@ -9360,18 +8861,22 @@ namespace tsl {
          * @param gui Gui to change to
          * @return Reference to the Gui
          */
-        std::unique_ptr<tsl::Gui>& changeTo(std::unique_ptr<tsl::Gui>&& gui) {
+        std::unique_ptr<tsl::Gui>& changeTo(std::unique_ptr<tsl::Gui>&& gui, bool clearGlyphCache = false) {
             if (this->m_guiStack.top() != nullptr && this->m_guiStack.top()->m_focusedElement != nullptr)
                 this->m_guiStack.top()->m_focusedElement->resetClickAnimation();
             
             isNavigatingBackwards = false;
+
+            // cache frame for forward rendering using external list method (to be implemented)
+
             // Create the top element of the new Gui
             gui->m_topElement = gui->createUI();
 
             
             // Push the new Gui onto the stack
             this->m_guiStack.push(std::move(gui));
-            
+            if (clearGlyphCache)
+                tsl::gfx::FontManager::clearCache();
             return this->m_guiStack.top();
         }
 
@@ -9384,40 +8889,61 @@ namespace tsl {
          * @param args Arguments to pass to the Gui
          * @return Reference to the newly created Gui
          */
+        // Template version without clearGlyphCache (for backward compatibility)
         template<typename G, typename ...Args>
         std::unique_ptr<tsl::Gui>& changeTo(Args&&... args) {
-            return this->changeTo(std::make_unique<G>(std::forward<Args>(args)...));
+            return this->changeTo(std::make_unique<G>(std::forward<Args>(args)...), false);
         }
         
+        
         /**
-         * @brief Pops the top Gui from the stack and goes back to the last one
-         * @note The Overlay gets closes once there are no more Guis on the stack
+         * @brief Pops the top Gui(s) from the stack and goes back count number of times
+         * @param count Number of Guis to pop from the stack (default: 1)
+         * @note The Overlay gets closed once there are no more Guis on the stack
          */
-        void goBack() {
+        void goBack(u32 count = 1) {
             isNavigatingBackwards = true;
-            if (!this->m_closeOnExit && this->m_guiStack.size() == 1) {
+            
+            // Clamp count to available stack size to prevent underflow
+            u32 actualCount = std::min(count, static_cast<u32>(this->m_guiStack.size()));
+            
+            // Special case: if we don't close on exit and popping everything would leave us with 0 or 1 GUI
+            if (!this->m_closeOnExit && this->m_guiStack.size() <= actualCount) {
                 this->hide();
                 return;
             }
             
-            if (!this->m_guiStack.empty())
+            // Pop the specified number of GUIs
+            for (u32 i = 0; i < actualCount && !this->m_guiStack.empty(); ++i) {
                 this->m_guiStack.pop();
+            }
             
-            if (this->m_guiStack.empty())
+            // Close overlay if stack is empty
+            if (this->m_guiStack.empty()) {
                 this->close();
+            }
         }
 
-        void pop() {
+        void pop(u32 count = 1) {
             isNavigatingBackwards = true;
-            if (!this->m_guiStack.empty())
+            
+            // Clamp count to available stack size to prevent underflow
+            u32 actualCount = std::min(count, static_cast<u32>(this->m_guiStack.size()));
+            
+            // Pop the specified number of GUIs
+            for (u32 i = 0; i < actualCount; ++i) {
                 this->m_guiStack.pop();
+            }
         }
+
         
         template<typename G, typename ...Args>
         friend std::unique_ptr<tsl::Gui>& changeTo(Args&&... args);
+        template<typename G, typename ...Args>
+        friend std::unique_ptr<tsl::Gui>& changeToWithCacheCLear(Args&&... args);
         
-        friend void goBack();
-        friend void pop();
+        friend void goBack(u32 count);
+        friend void pop(u32 count);
         
         template<typename, tsl::impl::LaunchFlags>
         friend int loop(int argc, char** argv);
@@ -9457,29 +8983,14 @@ namespace tsl {
         static void parseOverlaySettings() {
             hlp::ini::IniData parsedConfig = hlp::ini::readOverlaySettings(ULTRAHAND_CONFIG_FILE);
             
-            // Get combo string and check if it's valid before decoding
-            std::string comboStr = parsedConfig[ult::ULTRAHAND_PROJECT_NAME][ult::KEY_COMBO_STR];
-            ult::removeQuotes(comboStr);
-            
-            u64 decodedKeys = 0;
-            if (!comboStr.empty()) {
-                decodedKeys = hlp::comboStringToKeys(comboStr);
-            }
-            
-            if (decodedKeys) {
+            u64 decodedKeys = hlp::comboStringToKeys(parsedConfig[ult::ULTRAHAND_PROJECT_NAME][ult::KEY_COMBO_STR]); // CUSTOM MODIFICATION
+            if (decodedKeys)
                 tsl::cfg::launchCombo = decodedKeys;
-            } else {
-                // Try Tesla config as fallback
+            else {
                 parsedConfig = hlp::ini::readOverlaySettings(TESLA_CONFIG_FILE);
-                comboStr = parsedConfig["tesla"][ult::KEY_COMBO_STR];
-                ult::removeQuotes(comboStr);
-                
-                if (!comboStr.empty()) {
-                    decodedKeys = hlp::comboStringToKeys(comboStr);
-                    if (decodedKeys) {
-                        tsl::cfg::launchCombo = decodedKeys;
-                    }
-                }
+                decodedKeys = hlp::comboStringToKeys(parsedConfig["tesla"][ult::KEY_COMBO_STR]);
+                if (decodedKeys)
+                    tsl::cfg::launchCombo = decodedKeys;
             }
             
             #if USING_WIDGET_DIRECTIVE
@@ -9505,6 +9016,7 @@ namespace tsl {
             ult::removeQuotes(hideSOCTempStr);
             ult::hideSOCTemp = hideSOCTempStr != ult::FALSE_STR;
             #endif
+            
         }
 
         /**
@@ -9858,16 +9370,21 @@ namespace tsl {
         return Overlay::get()->changeTo<G, Args...>(std::forward<Args>(args)...);
     }
     
+    template<typename G, typename ...Args>
+    std::unique_ptr<tsl::Gui>& changeToWithCacheClear(Args&&... args) {
+        return Overlay::get()->changeToWithCacheClear<G, Args...>(std::forward<Args>(args)...);
+    }
+
     /**
      * @brief Pops the top Gui from the stack and goes back to the last one
      * @note The Overlay gets closed once there are no more Guis on the stack
      */
-    static void goBack() {
-        Overlay::get()->goBack();
+    void goBack(u32 count) {
+        Overlay::get()->goBack(count);
     }
     
-    static void pop() {
-        Overlay::get()->pop();
+    void pop(u32 count) {
+        Overlay::get()->pop(count);
     }
         
     
@@ -9928,17 +9445,17 @@ namespace tsl {
         
         // Add required flags
         if (!hasSkipCombo) {
-            memcpy(p, " --skipCombo", 12);
+            __builtin_memcpy(p, " --skipCombo", 12);
             p += 12;
         }
         
         // Add foreground flag
-        memcpy(p, " --foregroundFix ", 17);
+        __builtin_memcpy(p, " --foregroundFix ", 17);
         p += 17;
         *p++ = (ult::resetForegroundCheck || ult::lastTitleID != ult::getTitleIdAsString()) ? '1' : '0';
         
         // Add last title ID
-        memcpy(p, " --lastTitleID ", 15);
+        __builtin_memcpy(p, " --lastTitleID ", 15);
         p += 15;
         const char* titleId = ult::lastTitleID.c_str();
         while (*titleId) *p++ = *titleId++;
@@ -10008,6 +9525,7 @@ namespace tsl {
                             g_overlayFilename = "";
                             jumpItemName = "";
                             jumpItemValue = "";
+                            jumpItemExactMatch = true;
                             break;
                             
                         case 2: // skipCombo  
