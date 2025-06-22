@@ -147,14 +147,17 @@ double elapsedTime;
 
 // Custom variables
 //static bool jumpToListItem = false;
-static bool jumpToTop = false;
-static bool jumpToBottom = false;
-static u32 offsetWidthVar = 112;
-static bool hideHidden = false;
-static std::string g_overlayFilename;;
-static std::string jumpItemName;
-static std::string jumpItemValue;
-static bool jumpItemExactMatch = true;
+inline bool jumpToTop = false;
+inline bool jumpToBottom = false;
+inline u32 offsetWidthVar = 112;
+inline std::string g_overlayFilename;;
+inline std::string jumpItemName;
+inline std::string jumpItemValue;
+inline bool jumpItemExactMatch = true;
+
+#if IS_LAUNCHER_DIRECTIVE
+inline bool hideHidden = false;
+#endif
 
 namespace tsl {
 
@@ -543,7 +546,7 @@ namespace tsl {
         
     }
     
-    void goBack(u32 count = 1);
+    static void goBack(u32 count = 1);
 
     static void pop(u32 count = 1);
     
@@ -881,7 +884,11 @@ namespace tsl {
 
         // Forward declarations
         class Renderer;
-            
+        
+
+        #ifdef UI_OVERRIDE_PATH
+        inline static std::shared_mutex s_translationCacheMutex;
+        #endif
         class FontManager {
         public:
             struct Glyph {
@@ -937,21 +944,22 @@ namespace tsl {
             };
             
         private:
-            static std::shared_mutex s_cacheMutex;
-            static std::mutex s_initMutex;
+            inline static std::shared_mutex s_cacheMutex;
+            inline static std::mutex s_initMutex;
             
             // Use unique_ptr to ensure proper cleanup
-            static std::unordered_map<u64, std::unique_ptr<Glyph>> s_sharedGlyphCache;
+            inline static std::unordered_map<u64, std::unique_ptr<Glyph>> s_sharedGlyphCache;
             
             // Add cache size limits
             static constexpr size_t MAX_CACHE_SIZE = 10000;
             static constexpr size_t CLEANUP_THRESHOLD = 8000;
             
-            static stbtt_fontinfo* s_stdFont;
-            static stbtt_fontinfo* s_localFont;
-            static stbtt_fontinfo* s_extFont;
-            static bool s_hasLocalFont;
-            static bool s_initialized;
+            // font handles & state
+            inline static stbtt_fontinfo* s_stdFont     = nullptr;
+            inline static stbtt_fontinfo* s_localFont   = nullptr;
+            inline static stbtt_fontinfo* s_extFont     = nullptr;
+            inline static bool             s_hasLocalFont = false;
+            inline static bool             s_initialized  = false;
             
             // Fix cache key generation to prevent collisions
             static u64 generateCacheKey(u32 character, bool monospace, u32 fontSize) {
@@ -1115,14 +1123,14 @@ namespace tsl {
         };
         
         // Static member definitions
-        std::shared_mutex FontManager::s_cacheMutex;
-        std::mutex FontManager::s_initMutex;
-        std::unordered_map<u64, std::unique_ptr<FontManager::Glyph>> FontManager::s_sharedGlyphCache;
-        stbtt_fontinfo* FontManager::s_stdFont = nullptr;
-        stbtt_fontinfo* FontManager::s_localFont = nullptr;
-        stbtt_fontinfo* FontManager::s_extFont = nullptr;
-        bool FontManager::s_hasLocalFont = false;
-        bool FontManager::s_initialized = false;
+       //std::shared_mutex FontManager::s_cacheMutex;
+       //std::mutex FontManager::s_initMutex;
+       //std::unordered_map<u64, std::unique_ptr<FontManager::Glyph>> FontManager::s_sharedGlyphCache;
+       //stbtt_fontinfo* FontManager::s_stdFont = nullptr;
+       //stbtt_fontinfo* FontManager::s_localFont = nullptr;
+       //stbtt_fontinfo* FontManager::s_extFont = nullptr;
+       //bool FontManager::s_hasLocalFont = false;
+       //bool FontManager::s_initialized = false;
         
         // Updated thread-safe calculateStringWidth function
         static float calculateStringWidth(const std::string& originalString, const float fontSize, const bool monospace = false) {
@@ -2617,10 +2625,11 @@ namespace tsl {
                     }
                 }
                 
+                // Move variable declarations outside the loop
+                u32 currCharacter;
+                ssize_t codepointWidth;
+                
                 while (itStr != itStrEnd) {
-                    u32 currCharacter;
-                    ssize_t codepointWidth;
-                    
                     // Decode UTF-8 codepoint
                     if (isAsciiOnly) {
                         currCharacter = static_cast<u32>(*itStr);
@@ -2781,7 +2790,7 @@ namespace tsl {
                         offset -= 5;
                     auto [width, height] = getTextDimensions(PCB_temperatureStr, false, 20);
                     pcbWidth = width;
-                    drawString(PCB_temperatureStr, false, tsl::cfg::FramebufferWidth + offset - pcbWidth - chargeWidth - 22, y_offset, 20, a(tsl::GradientColor(ult::PCB_temperature)));
+                    drawString(PCB_temperatureStr, false, tsl::cfg::FramebufferWidth + offset - pcbWidth - chargeWidth - 20, y_offset, 20, a(tsl::GradientColor(ult::PCB_temperature)));
                 }
             
                 if (!ult::hideSOCTemp && ult::SOC_temperature > 0) {
@@ -2789,7 +2798,7 @@ namespace tsl {
                         offset -= 5;
                     auto [width, height] = getTextDimensions(SOC_temperatureStr, false, 20);
                     socWidth = width;
-                    drawString(SOC_temperatureStr, false, tsl::cfg::FramebufferWidth + offset - socWidth - pcbWidth - chargeWidth - 22, y_offset, 20, a(tsl::GradientColor(ult::SOC_temperature)));
+                    drawString(SOC_temperatureStr, false, tsl::cfg::FramebufferWidth + offset - socWidth - pcbWidth - chargeWidth - 20, y_offset, 20, a(tsl::GradientColor(ult::SOC_temperature)));
                 }
             }
             #endif
@@ -2823,22 +2832,28 @@ namespace tsl {
                 const s32 endX = std::min(glyph->width, static_cast<s32>(cfg::FramebufferWidth) - xPos);
                 const s32 endY = std::min(glyph->height, static_cast<s32>(cfg::FramebufferHeight) - yPos);
                 
+                // Move variable declarations outside loops
+                const s32 simdEnd = std::min(endX, (startX + 7) & ~7);
+                s32 bmpX;
+                uint8_t alpha;
+                s32 pixelX;
+                Color tmpColor = {0};
+                
                 // Render with optimized inner loop
                 const uint8_t* bmpPtr = glyph->glyphBmp + startY * glyph->width;
                 for (s32 bmpY = startY; bmpY < endY; ++bmpY) {
                     const s32 pixelY = yPos + bmpY;
-                    s32 bmpX = startX;
+                    bmpX = startX;
                     
                     // Process 8 pixels at once
-                    const s32 simdEnd = std::min(endX, (startX + 7) & ~7);
                     for (; bmpX < simdEnd; ++bmpX) {
-                        const uint8_t alpha = bmpPtr[bmpX] >> 4;
+                        alpha = bmpPtr[bmpX] >> 4;
                         if (alpha) {
-                            const s32 pixelX = xPos + bmpX;
+                            pixelX = xPos + bmpX;
                             if (alpha == 0xF) {
                                 this->setPixel(pixelX, pixelY, color, this->getPixelOffset(pixelX, pixelY));
                             } else {
-                                Color tmpColor = color;
+                                tmpColor = color;
                                 tmpColor.a = alpha;
                                 this->setPixelBlendDst(pixelX, pixelY, tmpColor);
                             }
@@ -2847,13 +2862,13 @@ namespace tsl {
                     
                     // Process remaining pixels
                     for (; bmpX < endX; ++bmpX) {
-                        const uint8_t alpha = bmpPtr[bmpX] >> 4;
+                        alpha = bmpPtr[bmpX] >> 4;
                         if (alpha) {
-                            const s32 pixelX = xPos + bmpX;
+                            pixelX = xPos + bmpX;
                             if (alpha == 0xF) {
                                 this->setPixel(pixelX, pixelY, color, this->getPixelOffset(pixelX, pixelY));
                             } else {
-                                Color tmpColor = color;
+                                tmpColor = color;
                                 tmpColor.a = alpha;
                                 this->setPixelBlendDst(pixelX, pixelY, tmpColor);
                             }
@@ -2891,9 +2906,6 @@ namespace tsl {
             
             std::stack<ScissoringConfig> m_scissoringStack;
             
-            #ifdef UI_OVERRIDE_PATH
-            static std::shared_mutex s_translationCacheMutex;
-            #endif
 
             static inline float s_opacity = 1.0F;
             
@@ -3905,14 +3917,14 @@ namespace tsl {
 
             virtual void draw(gfx::Renderer* renderer) override {
 
-                renderer->enableScissoring(0, 97, tsl::cfg::FramebufferWidth, tsl::cfg::FramebufferHeight - 73 - 97 - 4);
+                //renderer->enableScissoring(0, 97, tsl::cfg::FramebufferWidth, tsl::cfg::FramebufferHeight - 73 - 97 - 4);
                 
                 if (!hideTableBackground)
                     renderer->drawRoundedRect(this->getX() + 4+2, this->getY()-6, this->getWidth() +2, this->getHeight() + 20 - endGap+2, 10.0, a(tableBGColor));
                 
                 m_renderFunc(renderer, this->getX() + 4, this->getY(), this->getWidth() + 4, this->getHeight());
                 
-                renderer->disableScissoring();
+                //renderer->disableScissoring();
             }
             
             virtual void layout(u16 parentX, u16 parentY, u16 parentWidth, u16 parentHeight) override {}
@@ -4708,6 +4720,12 @@ namespace tsl {
                     clearItems();
                     return;
                 }
+
+                // Draw: backup reset if instance missed its chance  
+                if (!m_hasForwardCached) {
+                    cacheForwardFrameOnce = true;
+                    m_hasForwardCached = true;
+                }
                 
                 // Process pending operations in batch
                 if (!m_itemsToAdd.empty()) addPendingItems();
@@ -4740,7 +4758,7 @@ namespace tsl {
                 const s32 bottomBound = getBottomBound();
                 const s32 height = getHeight();
                 
-                renderer->enableScissoring(getLeftBound(), topBound, getWidth() + 8, height + 4);
+                renderer->enableScissoring(getLeftBound(), topBound-8, getWidth() + 8, height + 14);
         
                 // Optimized visibility culling
                 for (Element* entry : m_items) {
@@ -4754,14 +4772,15 @@ namespace tsl {
 
                 // FIXED: Check if content actually extends beyond viewport bounds
                 // Calculate the actual bottom position of the last item
-                s32 actualContentBottom = 0;
-                if (!m_items.empty()) {
-                    Element* lastItem = m_items.back();
-                    actualContentBottom = lastItem->getBottomBound() - getTopBound();
-                }
-        
+                //s32 actualContentBottom = 0;
+                //if (!m_items.empty()) {
+                //    Element* lastItem = m_items.back();
+                //    actualContentBottom = lastItem->getBottomBound() - getTopBound();
+                //}
+                
+
                 // Draw scrollbar only when needed
-                if (m_listHeight-20 > height || actualContentBottom-20 > height) {  // -20 fixes the alignment
+                if (m_listHeight > height) {  // -20 fixes the alignment
                     drawScrollbar(renderer, height);
                     updateScrollAnimation();
                 }
@@ -4784,17 +4803,20 @@ namespace tsl {
 
         
             virtual void layout(u16 parentX, u16 parentY, u16 parentWidth, u16 parentHeight) override {
-                y = getY() - m_offset;
+                s32 y = getY() - m_offset;
                 
-                // Calculate total height in single pass
-                m_listHeight = 9;
+                // Position all items first (don't calculate m_listHeight here)
                 for (Element* entry : m_items) {
-                    m_listHeight += entry->getHeight();
                     entry->setBoundaries(getX(), y, getWidth(), entry->getHeight());
                     entry->invalidate();
                     y += entry->getHeight();
                 }
-                y -= 0;
+                
+                // Calculate total height AFTER all invalidations are done
+                m_listHeight = BOTTOM_PADDING;
+                for (Element* entry : m_items) {
+                    m_listHeight += entry->getHeight();
+                }
             }
                                                 
             // Fixed onTouch method - prevents controller state corruption
@@ -4813,8 +4835,7 @@ namespace tsl {
                 if (event != TouchEvent::Release && Element::getInputMode() == InputMode::TouchScroll) {
                     if (prevX && prevY) {
                         m_nextOffset += (prevY - currY);
-                        m_nextOffset = std::clamp(m_nextOffset, 0.0f, 
-                            static_cast<float>(m_listHeight - getHeight()));
+                        m_nextOffset = std::clamp(m_nextOffset, 0.0f, static_cast<float>(m_listHeight - getHeight()));
                         
                         // Track that we're touch scrolling
                         m_touchScrollActive = true;
@@ -4832,7 +4853,7 @@ namespace tsl {
                 // First item optimization
                 if (actualItemCount == 0 && element->m_isItem) {
                     auto* customDrawer = new tsl::elm::CustomDrawer([](gfx::Renderer*, s32, s32, s32, s32) {});
-                    customDrawer->setBoundaries(getX(), getY(), getWidth(), tsl::style::ListItemDefaultHeight / 2);
+                    customDrawer->setBoundaries(getX(), getY(), getWidth(), 29+4);
                     customDrawer->setParent(this);
                     customDrawer->invalidate();
                     m_itemsToAdd.emplace_back(-1, customDrawer);
@@ -4967,6 +4988,7 @@ namespace tsl {
             bool m_jumpToExactMatch = false;
             bool m_pendingJump = false;
             bool m_skipFrame = false;
+            bool m_hasForwardCached = false;
 
             // Stack variables for hot path - reused to avoid allocations
             u32 scrollbarHeight;
@@ -4977,6 +4999,8 @@ namespace tsl {
             static constexpr float dampingFactor = 0.3f;
             static constexpr float TABLE_SCROLL_STEP_SIZE = 13;
             static constexpr float TABLE_SCROLL_STEP_SIZE_CLICK = 40;
+            static constexpr float BOTTOM_PADDING = 6.0f;
+
             float m_scrollVelocity = 0.0f;
             
             bool m_touchScrollActive = false;
@@ -5076,29 +5100,29 @@ namespace tsl {
                 s_cachedHeight = getHeight();
                 s_cachedListHeight = m_listHeight;
                 
-                s32 actualContentBottom = 0;
-                if (!m_items.empty()) {
-                    Element* lastItem = m_items.back();
-                    actualContentBottom = lastItem->getBottomBound() - s_cachedTopBound;
-                }
-                s_cachedActualContentBottom = actualContentBottom;
+                //s32 actualContentBottom = 0;
+                //if (!m_items.empty()) {
+                //    Element* lastItem = m_items.back();
+                //    actualContentBottom = lastItem->getBottomBound() - s_cachedTopBound;
+                //}
+                //s_cachedActualContentBottom = m_listHeight;
                 
                 // Cache scrollbar parameters (unchanged - uses full m_listHeight for correct sizing)
-                s_shouldDrawScrollbar = (s_cachedListHeight-20 > s_cachedHeight || s_cachedActualContentBottom-20 > s_cachedHeight);
+                s_shouldDrawScrollbar = (s_cachedListHeight > s_cachedHeight);
                 
                 if (s_shouldDrawScrollbar) {
-                    const float viewHeight = static_cast<float>(s_cachedHeight - 10);
-                    const float totalHeight = static_cast<float>(s_cachedListHeight-22);
+                    const float viewHeight = static_cast<float>(s_cachedHeight);
+                    const float totalHeight = static_cast<float>(s_cachedListHeight);
                     const u32 maxScrollableHeight = std::max(static_cast<u32>(totalHeight - viewHeight), 1u);
                     
                     s_cachedScrollbarHeight = std::min(static_cast<u32>((viewHeight * viewHeight) / totalHeight), 
                                                      static_cast<u32>(viewHeight));
                     
                     s_cachedScrollbarOffset = std::min(static_cast<u32>((m_offset / maxScrollableHeight) * (viewHeight - s_cachedScrollbarHeight)), 
-                                                     static_cast<u32>(viewHeight - s_cachedScrollbarOffset)) + 4;
+                                                     static_cast<u32>(viewHeight - s_cachedScrollbarOffset));
             
                     s_cachedScrollbarX = getRightBound() + 20;
-                    s_cachedScrollbarY = getY() + s_cachedScrollbarOffset + 2;
+                    s_cachedScrollbarY = getY() + s_cachedScrollbarOffset;
                 }
                 //s_isForwardCache = isForwardCache;
                 if (!isForwardCache)
@@ -5106,7 +5130,8 @@ namespace tsl {
             }
                                     
             void renderCachedFrame(gfx::Renderer* renderer) {
-                renderer->enableScissoring(getLeftBound(), s_cachedTopBound, getWidth() + 8, s_cachedHeight + 4);
+                //renderer->enableScissoring(getLeftBound(), s_cachedTopBound, getWidth() + 8, s_cachedHeight + 6);
+                renderer->enableScissoring(getLeftBound(), s_cachedTopBound-8, getWidth() + 8, s_cachedHeight + 14);
             
                 for (Element* entry : s_lastFrameItems) {
                     if (entry->getBottomBound() > s_cachedTopBound && entry->getTopBound() < s_cachedBottomBound) {
@@ -5173,18 +5198,20 @@ namespace tsl {
             }
             
             void drawScrollbar(gfx::Renderer* renderer, s32 height) {
-                const float viewHeight = static_cast<float>(height - 10);
-                const float totalHeight = static_cast<float>(m_listHeight-22);
+                const float viewHeight = static_cast<float>(height);
+                const float totalHeight = static_cast<float>(m_listHeight);
                 const u32 maxScrollableHeight = std::max(static_cast<u32>(totalHeight - viewHeight), 1u);
                 
                 scrollbarHeight = std::min(static_cast<u32>((viewHeight * viewHeight) / totalHeight), 
                                          static_cast<u32>(viewHeight));
                 
                 scrollbarOffset = std::min(static_cast<u32>((m_offset / maxScrollableHeight) * (viewHeight - scrollbarHeight)), 
-                                         static_cast<u32>(viewHeight - scrollbarHeight)) + 4;
+                                         static_cast<u32>(viewHeight - scrollbarHeight));
         
                 const u32 scrollbarX = getRightBound() + 20;
-                const u32 scrollbarY = getY() + scrollbarOffset+2;
+                const u32 scrollbarY = getY() + scrollbarOffset+4;
+
+                scrollbarHeight-=6; // shorten very slightly
         
                 renderer->drawRect(scrollbarX, scrollbarY, 5, scrollbarHeight, a(trackBarColor));
                 renderer->drawCircle(scrollbarX + 2, scrollbarY, 2, true, a(trackBarColor));
@@ -5302,46 +5329,37 @@ namespace tsl {
                     prevOffset = m_offset;
                 }
             }
-                                            
+                                                        
             Element* handleInitialFocus(Element* oldFocus) {
+                const size_t itemCount = m_items.size();
+                if (itemCount == 0) return nullptr;
+                
                 size_t startIndex = 0;
                 
                 // Calculate starting index based on current scroll position
                 if (!oldFocus && m_offset > 0) {
                     float elementHeight = 0.0f;
-                    while (elementHeight < m_offset && startIndex < m_items.size() - 1) {
+                    const size_t maxIndex = itemCount - 1;
+                    while (elementHeight < m_offset && startIndex < maxIndex) {
                         elementHeight += m_items[startIndex]->getHeight();
-                        startIndex++;
+                        ++startIndex;
                     }
                 }
                 
                 resetNavigationState();
                 
                 // Save current offset to prevent scroll jumping
-                float savedOffset = m_offset;
-                float savedNextOffset = m_nextOffset;
+                const float savedOffset = m_offset;
+                const float savedNextOffset = m_nextOffset;
                 
-                // Try to focus items starting from the calculated index
-                for (size_t i = startIndex; i < m_items.size(); ++i) {
+                // Single loop with wraparound logic - visits each item exactly once
+                for (size_t count = 0; count < itemCount; ++count) {
+                    const size_t i = (startIndex + count) % itemCount;
+                    
                     if (!m_items[i]->isTable()) {
-                        Element* newFocus = m_items[i]->requestFocus(oldFocus, FocusDirection::None);
+                        Element* const newFocus = m_items[i]->requestFocus(oldFocus, FocusDirection::None);
                         if (newFocus && newFocus != oldFocus) {
                             m_focusedIndex = i;
-                            // Restore the scroll position to prevent jumping
-                            m_offset = savedOffset;
-                            m_nextOffset = savedNextOffset;
-                            return newFocus;
-                        }
-                    }
-                }
-                
-                // If nothing found from startIndex onwards, try from beginning
-                for (size_t i = 0; i < startIndex && i < m_items.size(); ++i) {
-                    if (!m_items[i]->isTable()) {
-                        Element* newFocus = m_items[i]->requestFocus(oldFocus, FocusDirection::None);
-                        if (newFocus && newFocus != oldFocus) {
-                            m_focusedIndex = i;
-                            // Restore the scroll position to prevent jumping
                             m_offset = savedOffset;
                             m_nextOffset = savedNextOffset;
                             return newFocus;
@@ -5542,22 +5560,18 @@ namespace tsl {
                     }
                 }
                 
-                // Variables pulled outside the loop for optimization
-                Element* item;
-                Element* newFocus;
-                s32 tableBottom;
-                s32 viewBottom = getBottomBound(); // Cached since it likely doesn't change during loop
-                float itemBottom;
-                float containerHeight = getHeight(); // Cache this as well since it's used in calculation
-                float offsetPlusHeight = m_offset + containerHeight; // Pre-calculate this sum
+                // Cache invariant values (legitimate optimization)
+                const s32 viewBottom = getBottomBound();
+                const float containerHeight = getHeight();
+                const float offsetPlusHeight = m_offset + containerHeight;
                 
                 while (searchIndex < m_items.size()) {
-                    item = m_items[searchIndex];
+                    Element* item = m_items[searchIndex];
                     m_focusedIndex = searchIndex;
                     
                     if (item->isTable()) {
                         // Table needs scrolling
-                        tableBottom = item->getBottomBound();
+                        const s32 tableBottom = item->getBottomBound();
                         if (tableBottom > viewBottom) {
                             isTableScrolling = true;
                             scrollDown();
@@ -5568,7 +5582,7 @@ namespace tsl {
                     }
                     
                     // Try to focus this item
-                    newFocus = item->requestFocus(oldFocus, FocusDirection::Down);
+                    Element* newFocus = item->requestFocus(oldFocus, FocusDirection::Down);
                     if (newFocus && newFocus != oldFocus) {
                         // ONLY reset when we successfully focus something
                         isTableScrolling = false;
@@ -5576,7 +5590,7 @@ namespace tsl {
                         return newFocus;
                     } else {
                         // Non-focusable item (gap/header)
-                        itemBottom = calculateItemPosition(searchIndex) + item->getHeight();
+                        const float itemBottom = calculateItemPosition(searchIndex) + item->getHeight();
                         if (itemBottom > offsetPlusHeight) {
                             isTableScrolling = true;  // Treat gaps/headers like tables
                             scrollDown();
@@ -5589,7 +5603,6 @@ namespace tsl {
                 return oldFocus;
             }
             
-            // Optimized version with variable definitions pulled outside the loop
             inline Element* navigateUp(Element* oldFocus) {
                 if (m_focusedIndex == 0) return oldFocus;
                 ssize_t searchIndex = static_cast<ssize_t>(m_focusedIndex) - 1;
@@ -5604,20 +5617,17 @@ namespace tsl {
                     }
                 }
                 
-                // Variables pulled outside the loop for optimization
-                Element* item;
-                Element* newFocus;
-                s32 tableTop;
-                s32 viewTop = getTopBound(); // This can be cached since it likely doesn't change during loop
-                float itemTop;
+                // Cache invariant values (legitimate optimization)
+                const s32 viewTop = getTopBound();
+                const float offset = m_offset;  // Cache in case m_offset is volatile or has accessor overhead
                 
                 while (searchIndex >= 0) {
-                    item = m_items[searchIndex];
+                    Element* item = m_items[searchIndex];
                     m_focusedIndex = static_cast<size_t>(searchIndex);
                     
                     if (item->isTable()) {
                         // Table needs scrolling
-                        tableTop = item->getTopBound();
+                        const s32 tableTop = item->getTopBound();
                         if (tableTop < viewTop) {
                             isTableScrolling = true;
                             scrollUp();
@@ -5628,7 +5638,7 @@ namespace tsl {
                     }
                     
                     // Try to focus this item
-                    newFocus = item->requestFocus(oldFocus, FocusDirection::Up);
+                    Element* newFocus = item->requestFocus(oldFocus, FocusDirection::Up);
                     if (newFocus && newFocus != oldFocus) {
                         // ONLY reset when we successfully focus something
                         isTableScrolling = false;
@@ -5636,8 +5646,8 @@ namespace tsl {
                         return newFocus;
                     } else {
                         // Non-focusable item (gap/header)
-                        itemTop = calculateItemPosition(static_cast<size_t>(searchIndex));
-                        if (itemTop < m_offset) {
+                        const float itemTop = calculateItemPosition(static_cast<size_t>(searchIndex));
+                        if (itemTop < offset) {
                             isTableScrolling = true;  // Treat gaps/headers like tables
                             scrollUp();
                             return oldFocus;
@@ -5648,7 +5658,6 @@ namespace tsl {
                 
                 return oldFocus;
             }
-            
             
             // Helper method to calculate an item's position in the list
             inline float calculateItemPosition(size_t index) {
@@ -5727,12 +5736,9 @@ namespace tsl {
                 // Reset table scrolling when wrapping
                 isTableScrolling = false;
                 
-                // Variables pulled outside the loop for optimization
-                Element* newFocus;
-                
                 // Find first focusable item (including tables)
                 for (size_t i = 0; i < m_items.size(); ++i) {
-                    newFocus = m_items[i]->requestFocus(oldFocus, FocusDirection::Down);
+                    Element* newFocus = m_items[i]->requestFocus(oldFocus, FocusDirection::Down);
                     if (newFocus && newFocus != oldFocus) {
                         m_focusedIndex = i;
                         m_nextOffset = 0.0f;
@@ -5752,13 +5758,13 @@ namespace tsl {
                 
                 invalidate();
                 
-                // Variables pulled outside the loop for optimization
-                Element* newFocus;
-                float maxOffset = (m_listHeight > getHeight()) ? static_cast<float>(m_listHeight - getHeight()) : 0.0f;
+                // Calculate max offset once (this is a good optimization to keep)
+                const float maxOffset = (m_listHeight > getHeight()) ? 
+                                        static_cast<float>(m_listHeight - getHeight()) : 0.0f;
                 
                 // Find last focusable item (including tables)
                 for (ssize_t i = static_cast<ssize_t>(m_items.size()) - 1; i >= 0; --i) {
-                    newFocus = m_items[i]->requestFocus(oldFocus, FocusDirection::Up);
+                    Element* newFocus = m_items[i]->requestFocus(oldFocus, FocusDirection::Up);
                     if (newFocus && newFocus != oldFocus) {
                         m_focusedIndex = static_cast<size_t>(i);
                         if (m_listHeight > getHeight()) {
@@ -5784,15 +5790,15 @@ namespace tsl {
                 resetNavigationState();
                 jumpToBottom = false;  // Reset flag
                 
-                // Variables pulled outside the loop for optimization
-                Element* test;
-                float targetOffset = (m_listHeight > getHeight()) ? static_cast<float>(m_listHeight - getHeight()) : 0.0f;
+                // Calculate target offset once (good optimization to keep)
+                const float targetOffset = (m_listHeight > getHeight()) ? 
+                                           static_cast<float>(m_listHeight - getHeight()) : 0.0f;
                 const float tolerance = 5.0f;
                 
                 // Find the last focusable item
                 size_t lastFocusableIndex = m_items.size();
                 for (ssize_t i = static_cast<ssize_t>(m_items.size()) - 1; i >= 0; --i) {
-                    test = m_items[i]->requestFocus(nullptr, FocusDirection::None);
+                    Element* test = m_items[i]->requestFocus(nullptr, FocusDirection::None);
                     if (test) {
                         lastFocusableIndex = static_cast<size_t>(i);
                         break;
@@ -5833,15 +5839,14 @@ namespace tsl {
                 resetNavigationState();
                 jumpToTop = false;  // Reset flag
                 
-                // Variables pulled outside the loop for optimization
-                Element* test;
-                float targetOffset = 0.0f;
+                // Define constants for clarity and consistency
+                const float targetOffset = 0.0f;
                 const float tolerance = 5.0f;
                 
                 // Find the first focusable item
                 size_t firstFocusableIndex = m_items.size();  // Default to invalid
                 for (size_t i = 0; i < m_items.size(); ++i) {
-                    test = m_items[i]->requestFocus(nullptr, FocusDirection::None);
+                    Element* test = m_items[i]->requestFocus(nullptr, FocusDirection::None);
                     if (test) {
                         firstFocusableIndex = i;
                         break;
@@ -6723,10 +6728,10 @@ namespace tsl {
             
             virtual void draw(gfx::Renderer *renderer) override {
                 if (this->m_hasSeparator) {
-                    renderer->drawRect(this->getX()+1+1, this->getBottomBound() - 29, 4, 22, a(headerSeparatorColor));
-                    renderer->drawString(this->m_text, false, this->getX() + 15+1, this->getBottomBound() - 12, 16, a(headerTextColor));
+                    renderer->drawRect(this->getX()+1+1, this->getBottomBound() - 29-4, 4, 22, a(headerSeparatorColor));
+                    renderer->drawString(this->m_text, false, this->getX() + 15+1, this->getBottomBound() - 12-4, 16, a(headerTextColor));
                 } else {
-                    renderer->drawString(this->m_text, false, this->getX(), this->getBottomBound() - 12, 16, a(headerTextColor));
+                    renderer->drawString(this->m_text, false, this->getX(), this->getBottomBound() - 12-4, 16, a(headerTextColor));
                 }
                 //if (this->m_hasSeparator)
                 //    renderer->drawRect(this->getX(), this->getBottomBound(), this->getWidth(), 1, tsl::style::color::ColorFrame); // CUSTOM MODIFICATION
@@ -6736,11 +6741,11 @@ namespace tsl {
                 // Check if the CategoryHeader is part of a list and if it's the first entry in it, half it's height
                 if (List *list = static_cast<List*>(this->getParent()); list != nullptr) {
                     if (list->getIndexInList(this) == 0) {
-                        this->setBoundaries(this->getX(), this->getY()-4, this->getWidth(), tsl::style::ListItemDefaultHeight / 2);
+                        this->setBoundaries(this->getX(), this->getY(), this->getWidth(), 29+4);
                         return;
                     }
                 }
-                this->setBoundaries(this->getX(), this->getY()-4, this->getWidth(), tsl::style::ListItemDefaultHeight *0.90);
+                this->setBoundaries(this->getX(), this->getY(), this->getWidth(), tsl::style::ListItemDefaultHeight *0.90);
                 //if (m_hasSeparator) { // CUSTOM MODIFICATION
                 //    this->setBoundaries(this->getX(), this->getY()-4, this->getWidth(), tsl::style::ListItemDefaultHeight *0.90); // CUSTOM MODIFICATION
                 //} else {
